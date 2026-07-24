@@ -1,0 +1,24 @@
+# Node
+node_modules/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Service account keys / secrets
+*.json
+!app.json
+!firebase.json
+*service-account*.json
+*key*.json
+*.pem
+*.p12
+
+# OS/editor noise
+.DS_Store
+.vscode/
