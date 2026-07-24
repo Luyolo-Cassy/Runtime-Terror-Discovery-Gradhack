@@ -1,0 +1,1 @@
+-- Placeholder for customer profile view SQL.
