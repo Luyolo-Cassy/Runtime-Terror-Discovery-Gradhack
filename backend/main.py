@@ -31,8 +31,10 @@ import catalogue_service
 # ==========================================
 PROJECT_ID = "gradhack26jnb-408"
 DATASET = "gradhack26jnb-408.HealthyFood"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")          # no insecure default
-MODEL_NAME = "gemini-1.5-flash"
+# Gemini runs through Vertex AI using the SAME service account as BigQuery.
+# No API key. Override region/model via env if needed.
+LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 app = FastAPI(title="HealthyFood Companion API")
 
@@ -67,12 +69,8 @@ def get_bq():
 def get_model():
     global _model
     if _model is None:
-        import google.generativeai as genai
-        if not GEMINI_API_KEY:
-            raise HTTPException(status_code=500,
-                                detail="GEMINI_API_KEY is not set on the server.")
-        genai.configure(api_key=GEMINI_API_KEY)
-        _model = genai.GenerativeModel(MODEL_NAME)
+        import gemini_client
+        _model = gemini_client.VertexGemini(PROJECT_ID, LOCATION, MODEL_NAME)
     return _model
 
 
@@ -164,9 +162,9 @@ async def scan_receipt(user_id: str, file: UploadFile = File(...)):
     Return ONLY a valid JSON list of strings, e.g.: ["Apples", "Full Cream Milk"]
     No markdown, no extra text.
     """
-    response = get_model().generate_content(
-        [prompt, {"mime_type": file.content_type, "data": image_bytes}]
-    )
+    import gemini_client
+    image_part = gemini_client.build_image_part(image_bytes, file.content_type)
+    response = get_model().generate_content([prompt, image_part])
     raw = response.text.replace("```json", "").replace("```", "").strip()
     try:
         names = json.loads(raw)
