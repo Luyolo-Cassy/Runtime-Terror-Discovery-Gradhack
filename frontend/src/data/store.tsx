@@ -125,6 +125,8 @@ export interface AppState {
 
   recipes: SavedRecipe[];
   currentRecipe: GeneratedRecipe | null;
+  /** Result of the most recent slip scan, so the UI can show what was read. */
+  lastScan: api.ScanResult | null;
 
   /** Per-action spinners, keyed by an arbitrary label e.g. "recipe" or "scan". */
   busy: Record<string, boolean>;
@@ -148,6 +150,7 @@ type Action =
   | { type: "TOGGLE_SHOPPING"; id: string }
   | { type: "REMOVE_SHOPPING"; id: string }
   | { type: "SET_RECIPE"; recipe: GeneratedRecipe | null }
+  | { type: "SET_SCAN"; scan: api.ScanResult | null }
   | { type: "ADD_SAVED_RECIPE"; recipe: SavedRecipe }
   | { type: "ADD_POINTS"; amount: number }
   | { type: "SET_POINTS"; points: number; badges?: Badge[]; challenges?: Challenge[] }
@@ -177,6 +180,7 @@ function demoState(userId: string): AppState {
     vouchers: [],
     recipes: initialSavedRecipes,
     currentRecipe: null,
+    lastScan: null,
     busy: {},
     toast: null,
   };
@@ -269,6 +273,9 @@ function reducer(state: AppState, action: Action): AppState {
     case "SET_RECIPE":
       return { ...state, currentRecipe: action.recipe };
 
+    case "SET_SCAN":
+      return { ...state, lastScan: action.scan };
+
     case "ADD_SAVED_RECIPE":
       return { ...state, recipes: [action.recipe, ...state.recipes] };
 
@@ -306,6 +313,7 @@ export interface Actions {
   loadUsers: () => Promise<void>;
   importReceipt: (receiptId: string) => Promise<void>;
   scanSlip: (asset: api.ImageAsset) => Promise<void>;
+  clearScan: () => void;
   addPantryItem: (name: string) => Promise<void>;
   removePantryItem: (id: string) => Promise<void>;
   acceptSwap: (swap: Substitution) => Promise<void>;
@@ -460,13 +468,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [fail, setBusy, toast]);
 
   const scanSlip = useCallback(async (asset: api.ImageAsset) => {
+    // Demo mode still walks the whole flow so the screen can be demonstrated
+    // without a backend. The classifications below are canned, not real.
     if (!api.IS_LIVE) {
+      const demo = demoScanResult();
+      dispatch({ type: "SET_SCAN", scan: demo });
+      dispatch({
+        type: "ADD_PANTRY",
+        items: demo.classified
+          .filter((c) => c.is_healthy)
+          .map((c, i) => ({
+            id: `scan-demo-${Date.now()}-${i}`,
+            name: c.matched_item ?? c.input_name,
+            category: c.category ?? "Groceries",
+            qty: "1",
+            expiresIn: 7,
+            source: "scan",
+            isHealthy: true,
+          })),
+      });
       dispatch({ type: "ADD_POINTS", amount: 25 });
-      toast("Demo mode — connect the API to read real slips (+25 pts)");
+      toast(`Demo scan: ${demo.healthy_count} of ${demo.total_count} are HealthyFood (+25 pts)`);
       return;
     }
 
     setBusy("scan", true);
+    dispatch({ type: "SET_SCAN", scan: null });
     toast("Reading your slip…");
     try {
       const res = await api.scanSlip(ref.current.userId, asset);
@@ -474,6 +501,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         toast(res.message ?? "No food items were recognised in that image.");
         return;
       }
+      dispatch({ type: "SET_SCAN", scan: res });
       dispatch({ type: "ADD_POINTS", amount: res.points_awarded ?? 0 });
       dispatch({ type: "SET_PANTRY", pantry: await api.getPantry(ref.current.userId) });
       toast(
@@ -486,6 +514,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setBusy("scan", false);
     }
   }, [fail, setBusy, toast]);
+
+  const clearScan = useCallback(() => dispatch({ type: "SET_SCAN", scan: null }), []);
 
   // -------------------------------------------------------------------------
   // PANTRY
@@ -766,20 +796,54 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [hydrate]);
 
   const actions = useMemo<Actions>(() => ({
-    hydrate, switchUser, loadUsers, importReceipt, scanSlip, addPantryItem,
-    removePantryItem, acceptSwap, generateRecipe, addMissingToShopping,
-    toggleShopping, buyShopping, removeShopping, claimReward, completeChallenge,
-    updateProfile, toast, clearToast, reset,
+    hydrate, switchUser, loadUsers, importReceipt, scanSlip, clearScan,
+    addPantryItem, removePantryItem, acceptSwap, generateRecipe,
+    addMissingToShopping, toggleShopping, buyShopping, removeShopping,
+    claimReward, completeChallenge, updateProfile, toast, clearToast, reset,
   }), [
-    hydrate, switchUser, loadUsers, importReceipt, scanSlip, addPantryItem,
-    removePantryItem, acceptSwap, generateRecipe, addMissingToShopping,
-    toggleShopping, buyShopping, removeShopping, claimReward, completeChallenge,
-    updateProfile, toast, clearToast, reset,
+    hydrate, switchUser, loadUsers, importReceipt, scanSlip, clearScan,
+    addPantryItem, removePantryItem, acceptSwap, generateRecipe,
+    addMissingToShopping, toggleShopping, buyShopping, removeShopping,
+    claimReward, completeChallenge, updateProfile, toast, clearToast, reset,
   ]);
 
   return (
     <AppContext.Provider value={{ state, actions }}>{children}</AppContext.Provider>
   );
+}
+
+/**
+ * A plausible scan result for demo mode.
+ *
+ * Shaped exactly like the real /api/pantry/scan response so the results card
+ * renders identically whether or not a backend is attached. Note the deliberate
+ * "no catalogue match" row - that case has to be visible, because it's how the
+ * classifier behaves honestly when it can't place an item.
+ */
+function demoScanResult(): api.ScanResult {
+  const classified: api.ClassifiedItem[] = [
+    { input_name: "Baby marrow", matched_item: "Baby marrow Rhodes", category: "Fruit and vegetables", retailer: "Checkers", is_healthy: true, status: "healthy" },
+    { input_name: "Rolled oats 1kg", matched_item: "Rolled oats Bokomo", category: "Whole grains and high-fibre starchy foods", retailer: "Checkers", is_healthy: true, status: "healthy" },
+    { input_name: "Lentils", matched_item: "Lentils Imbo", category: "Legumes", retailer: "Woolworths", is_healthy: true, status: "healthy" },
+    { input_name: "Chocolate slab", matched_item: "Chocolate Beacon", category: "Unhealthy foods", retailer: "Checkers", is_healthy: false, status: "unhealthy" },
+    { input_name: "Serviettes 2ply", matched_item: null, category: null, retailer: null, is_healthy: false, status: "exempt", reason: "no_match" },
+  ];
+  const healthy = classified.filter((c) => c.status === "healthy");
+  return {
+    status: "success",
+    classified,
+    inserted_items: healthy.map((c) => ({
+      item_name: c.matched_item ?? c.input_name,
+      category: c.category ?? "Groceries",
+    })),
+    healthy_count: healthy.length,
+    unhealthy_count: classified.filter((c) => c.status === "unhealthy").length,
+    exempt_count: classified.filter((c) => c.status === "exempt").length,
+    total_count: classified.length,
+    saved_to_pantry: healthy.length,
+    catalogue_available: true,
+    points_awarded: 25,
+  };
 }
 
 export function useApp() {

@@ -1,7 +1,12 @@
 import React, { useState } from "react";
-import { Alert, Image, StyleSheet, Text, View } from "react-native";
+import { Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
 import * as ImagePicker from "expo-image-picker";
-import { Camera, Check, CheckCircle2, Link2, ScanLine, Store, Upload, XCircle } from "lucide-react-native";
+
+import { SlipCamera } from "@/components/slip-camera";
+import {
+  Camera, Check, CheckCircle2, HelpCircle, Link2, ScanLine, Sparkles, Store,
+  Upload, X, XCircle,
+} from "lucide-react-native";
 
 import { ActionButton, Card, EmptyState, Screen, SectionLabel } from "@/components/ui";
 import { Colors, Radius, Spacing, alpha } from "@/constants/theme";
@@ -11,56 +16,52 @@ import type { Receipt } from "@/data/mockData";
 export default function ReceiptsScreen() {
   const { state, actions } = useApp();
   const [preview, setPreview] = useState<string | null>(null);
+  const [cameraOpen, setCameraOpen] = useState(false);
 
   const partner = state.receipts.filter((r) => r.partner);
   const scanned = state.receipts.filter((r) => !r.partner);
   const scanning = Boolean(state.busy.scan);
 
-  /**
-   * One handler for both routes in. `launchCameraAsync` needs an explicit
-   * permission prompt; the library picker on modern iOS/Android does not, but
-   * asking anyway keeps the failure mode a clear message rather than a silent
-   * no-op.
-   */
-  async function pick(source: "camera" | "library") {
-    try {
-      if (source === "camera") {
-        const perm = await ImagePicker.requestCameraPermissionsAsync();
-        if (!perm.granted) {
-          Alert.alert(
-            "Camera access needed",
-            "HealthyFood needs the camera to read your till slip. You can enable it in Settings.",
-          );
-          return;
-        }
-      }
+  /** Shared tail for both capture routes: preview it, then send it to be read. */
+  async function submit(asset: { uri: string; fileName?: string | null; mimeType?: string | null }) {
+    setPreview(asset.uri);
+    await actions.scanSlip({
+      uri: asset.uri,
+      fileName: asset.fileName,
+      mimeType: asset.mimeType,
+    });
+  }
 
-      const options: ImagePicker.ImagePickerOptions = {
+  /**
+   * Upload route — the photo library / file picker.
+   *
+   * The camera route deliberately does NOT go through ImagePicker: on desktop
+   * web `launchCameraAsync` has no native camera to hand off to and silently
+   * degrades to this same file picker. SlipCamera uses getUserMedia instead, so
+   * the shutter works on a laptop too.
+   */
+  async function pickFromLibrary() {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
         quality: 0.7,          // Vertex AI rejects very large payloads
         allowsEditing: false,
-      };
-
-      const result = source === "camera"
-        ? await ImagePicker.launchCameraAsync(options)
-        : await ImagePicker.launchImageLibraryAsync(options);
-
-      if (result.canceled || !result.assets?.length) return;
-
-      const asset = result.assets[0];
-      setPreview(asset.uri);
-      await actions.scanSlip({
-        uri: asset.uri,
-        fileName: asset.fileName,
-        mimeType: asset.mimeType,
       });
+      if (result.canceled || !result.assets?.length) return;
+      await submit(result.assets[0]);
     } catch (err) {
-      actions.toast(`Could not open the ${source}: ${(err as Error).message}`);
+      Alert.alert("Could not open your photos", (err as Error).message);
     }
   }
 
   return (
     <Screen title="Receipts" subtitle="Partner baskets fill your pantry automatically">
+      <SlipCamera
+        visible={cameraOpen}
+        onClose={() => setCameraOpen(false)}
+        onCapture={submit}
+      />
+
       <View style={styles.scanBox}>
         {preview ? (
           <Image source={{ uri: preview }} style={styles.preview} accessibilityLabel="The slip you just captured" />
@@ -81,7 +82,7 @@ export default function ReceiptsScreen() {
           <ActionButton
             label="Camera"
             icon={<Camera size={16} color={Colors.primaryFg} />}
-            onPress={() => pick("camera")}
+            onPress={() => setCameraOpen(true)}
             busy={scanning}
             style={styles.flex}
           />
@@ -89,7 +90,7 @@ export default function ReceiptsScreen() {
             label="Upload"
             variant="outline"
             icon={<Upload size={16} color={Colors.foreground} />}
-            onPress={() => pick("library")}
+            onPress={pickFromLibrary}
             disabled={scanning}
             style={styles.flex}
           />
@@ -101,6 +102,8 @@ export default function ReceiptsScreen() {
           </Text>
         ) : null}
       </View>
+
+      <ScanResults />
 
       <SectionLabel>Partner baskets · shared with your consent</SectionLabel>
       <Text style={styles.hint}>
@@ -128,6 +131,108 @@ export default function ReceiptsScreen() {
         </>
       ) : null}
     </Screen>
+  );
+}
+
+/**
+ * What the engine actually read off the photo.
+ *
+ * Worth showing rather than hiding behind a toast: it makes the split of
+ * responsibility visible. Gemini supplies `input_name` (what it saw), and the
+ * HealthyFood catalogue supplies `matched_item`, `category` and the healthy
+ * verdict. When a line has no catalogue match we say so instead of guessing —
+ * an unmatched item is not counted as healthy and does not enter the pantry.
+ */
+function ScanResults() {
+  const { state, actions } = useApp();
+  const scan = state.lastScan;
+  if (!scan || !scan.classified.length) return null;
+
+  const exempt = scan.exempt_count ?? scan.classified.filter((c) => c.status === "exempt").length;
+  const unhealthy = scan.unhealthy_count ?? scan.classified.filter((c) => c.status === "unhealthy").length;
+  const offline = scan.catalogue_available === false;
+
+  return (
+    <Card style={{ borderColor: alpha(Colors.primary, 0.4) }}>
+      <View style={styles.receiptHead}>
+        <View style={styles.flex}>
+          <View style={styles.inlineRow}>
+            <Sparkles size={15} color={Colors.primary} />
+            <Text style={styles.storeName}>What we read off your slip</Text>
+          </View>
+          <Text style={styles.scanSummary}>
+            {scan.total_count} item{scan.total_count === 1 ? "" : "s"} detected ·{" "}
+            {scan.healthy_count} healthy · {unhealthy} unhealthy · {exempt} exempt
+          </Text>
+        </View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Dismiss scan results"
+          onPress={actions.clearScan}
+          hitSlop={8}
+          style={styles.dismiss}
+        >
+          <X size={15} color={Colors.muted} />
+        </Pressable>
+      </View>
+
+      {/* When the catalogue is unreachable we say so loudly rather than
+          letting a screen full of "exempt" look like a classification result. */}
+      {offline ? (
+        <View style={styles.offlineBanner}>
+          <HelpCircle size={14} color={Colors.warning} />
+          <Text style={styles.offlineText}>
+            The HealthyFood catalogue couldn't be reached, so nothing was verified.
+            Items are listed as read, not judged.
+          </Text>
+        </View>
+      ) : null}
+
+      <View style={styles.lines}>
+        {scan.classified.map((c, idx) => {
+          const tint = c.status === "healthy"
+            ? Colors.vitality
+            : c.status === "unhealthy" ? Colors.destructive : Colors.muted;
+
+          // Exempt items show what Gemini read; verified ones show the
+          // catalogue product they matched, which is the more useful name.
+          const primary = c.matched_item ?? c.input_name;
+          const detail = c.status === "exempt"
+            ? (c.reason === "catalogue_offline"
+                ? `read as "${c.input_name}" · not verified`
+                : `read as "${c.input_name}" · not in the catalogue`)
+            : [c.input_name !== c.matched_item ? `read as "${c.input_name}"` : null,
+               c.category, c.retailer].filter(Boolean).join(" · ");
+
+          return (
+            <View key={`${c.input_name}-${idx}`} style={styles.scanLine}>
+              {c.status === "healthy"
+                ? <CheckCircle2 size={15} color={Colors.vitality} />
+                : c.status === "unhealthy"
+                  ? <XCircle size={15} color={Colors.destructive} />
+                  : <HelpCircle size={15} color={Colors.muted} />}
+
+              <View style={styles.flex}>
+                <Text style={styles.lineName} numberOfLines={1}>{primary}</Text>
+                <Text style={styles.scanMeta} numberOfLines={1}>{detail}</Text>
+              </View>
+
+              <View style={[styles.verdict, { backgroundColor: alpha(tint, 0.15) }]}>
+                <Text style={[styles.verdictText, { color: tint }]}>{c.status}</Text>
+              </View>
+            </View>
+          );
+        })}
+      </View>
+
+      <Text style={styles.scanFootnote}>
+        {scan.saved_to_pantry
+          ? `${scan.saved_to_pantry} healthy item(s) added to your pantry. `
+          : ""}
+        Only items the catalogue verifies as HealthyFood are stored — anything we
+        can't confirm is marked exempt rather than guessed at.
+      </Text>
+    </Card>
   );
 }
 
@@ -238,6 +343,23 @@ const styles = StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: Colors.border,
   },
   lineName: { fontSize: 13, color: Colors.foreground, flexShrink: 1 },
+
+  scanSummary: { fontSize: 12, color: Colors.muted, marginTop: 3, lineHeight: 17 },
+  offlineBanner: {
+    flexDirection: "row", gap: 6, alignItems: "flex-start", marginTop: Spacing.md,
+    backgroundColor: alpha(Colors.warning, 0.12), borderRadius: Radius.sm,
+    padding: Spacing.md,
+  },
+  offlineText: { flex: 1, fontSize: 11, color: Colors.muted, lineHeight: 16 },
+  dismiss: { height: 28, width: 28, alignItems: "center", justifyContent: "center" },
+  scanLine: {
+    flexDirection: "row", alignItems: "center", gap: Spacing.sm, paddingVertical: 9,
+    borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: Colors.border,
+  },
+  scanMeta: { fontSize: 10, color: Colors.muted, marginTop: 2 },
+  verdict: { borderRadius: Radius.pill, paddingHorizontal: 8, paddingVertical: 3 },
+  verdictText: { fontSize: 10, fontWeight: "700" },
+  scanFootnote: { fontSize: 11, color: Colors.muted, marginTop: Spacing.md, lineHeight: 16 },
 
   tag: {
     flexDirection: "row", alignItems: "center", gap: 3,

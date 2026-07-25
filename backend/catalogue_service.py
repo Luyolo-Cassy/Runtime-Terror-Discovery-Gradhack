@@ -12,11 +12,14 @@ Used by the pantry-scan endpoint: Gemini reads item *names* off the photo
 (what it's good at); this module decides which of those are HealthyFood.
 """
 
+import logging
 import re
 import time
 from google.cloud import bigquery
 
 # words that carry no signal when matching a product name to the catalogue
+log = logging.getLogger("healthyfood.catalogue")
+
 _STOPWORDS = {
     "fresh", "the", "of", "and", "with", "low", "fat", "free", "full", "cream",
     "pack", "bag", "box", "each", "per", "kg", "g", "ml", "l", "x",
@@ -42,9 +45,10 @@ def load_catalogue(bq_client, dataset: str, force: bool = False):
     if not force and _CACHE["rows"] is not None and (now - _CACHE["loaded_at"]) < _CACHE_TTL_SECONDS:
         return _CACHE["rows"]
 
+    import config
     query = f"""
         SELECT item_name, category, subcategory, retailer, classification
-        FROM `{dataset}.foodCatalogue`
+        FROM `{config.FOOD_CATALOGUE}`
     """
     rows = [dict(r) for r in bq_client.query(query)]
     _CACHE["rows"] = rows
@@ -97,29 +101,47 @@ def classify_items(bq_client, dataset: str, item_names):
     """
     Classify a list of item names against the catalogue.
 
-    Returns a list of dicts:
-      {
-        "input_name": "...",        # what Gemini read off the photo
-        "matched_item": "..."|None, # catalogue item it matched (None if no match)
-        "category": "..."|None,     # catalogue category (better than Gemini's guess)
-        "retailer": "..."|None,
-        "classification": "..."|None,
-        "is_healthy": True/False,   # True only when catalogue says classification='healthy'
-      }
+    Every item lands in exactly one of three states, carried in `status`:
+
+      "healthy"   - matched a catalogue row classified healthy
+      "unhealthy" - matched a catalogue row classified otherwise
+      "exempt"    - we could not verify it, so we do not judge it
+
+    "exempt" covers two different situations that the caller may want to
+    distinguish, hence `reason`: the item isn't in the catalogue at all
+    ("no_match"), or the catalogue itself was unreachable ("catalogue_offline").
+
+    The important property is that a failure NEVER produces a health verdict.
+    The whole design rests on the catalogue - not the model - deciding what is
+    healthy, so when the catalogue can't answer, the honest output is "exempt"
+    rather than a guess in either direction.
     """
-    catalogue = load_catalogue(bq_client, dataset)
+    try:
+        catalogue = load_catalogue(bq_client, dataset)
+        catalogue_available = True
+    except Exception as exc:  # noqa: BLE001
+        # Degrade instead of failing: the user still gets to see what was read
+        # off their slip, just without verdicts.
+        log.warning("catalogue unavailable, classifying everything as exempt: %s", exc)
+        catalogue = []
+        catalogue_available = False
+
     results = []
     for name in item_names:
-        row, _score = _best_match(name, catalogue)
+        row, _score = _best_match(name, catalogue) if catalogue else (None, 0.0)
+
         if row:
             classification = (row.get("classification") or "").strip()
+            healthy = classification.lower() == "healthy"
             results.append({
                 "input_name": name,
                 "matched_item": row.get("item_name"),
                 "category": row.get("category"),
                 "retailer": row.get("retailer"),
                 "classification": classification or None,
-                "is_healthy": classification.lower() == "healthy",
+                "is_healthy": healthy,
+                "status": "healthy" if healthy else "unhealthy",
+                "reason": None,
             })
         else:
             results.append({
@@ -128,6 +150,9 @@ def classify_items(bq_client, dataset: str, item_names):
                 "category": None,
                 "retailer": None,
                 "classification": None,
-                "is_healthy": False,   # not in the HealthyFood catalogue -> not counted healthy
+                "is_healthy": False,   # exempt is never counted as healthy
+                "status": "exempt",
+                "reason": "catalogue_offline" if not catalogue_available else "no_match",
             })
-    return results
+
+    return results, catalogue_available

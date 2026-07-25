@@ -69,9 +69,10 @@ def get_healthy_catalogue(bq_client, dataset: str, limit: int = CATALOGUE_SAMPLE
     Tries the healthy filter first; if that returns nothing (because our guessed
     classification tokens don't match your data), falls back to the full catalogue.
     """
+    import config
     base = f"""
         SELECT item_name, category, subcategory, retailer, classification
-        FROM `{dataset}.foodCatalogue`
+        FROM `{config.FOOD_CATALOGUE}`
     """
     filtered = base + " WHERE LOWER(classification) IN UNNEST(@terms) LIMIT @lim"
     cfg = bigquery.QueryJobConfig(query_parameters=[
