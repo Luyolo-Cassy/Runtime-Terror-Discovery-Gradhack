@@ -155,20 +155,33 @@ export const listUsers = () =>
 export const getPantry = (userId: string) =>
   get<{ items: PantryItem[] }>(`/api/pantry/${encodeURIComponent(userId)}`).then((r) => r.items);
 
+/** Every scanned line lands in one of three states. */
+export type ItemStatus = "healthy" | "unhealthy" | "exempt";
+
+export interface ClassifiedItem {
+  input_name: string;                 // what Gemini read off the photo
+  matched_item: string | null;        // the catalogue product it matched
+  category: string | null;
+  retailer: string | null;
+  is_healthy: boolean;
+  status: ItemStatus;
+  /** Why it's exempt: not in the catalogue, or the catalogue was unreachable. */
+  reason?: "no_match" | "catalogue_offline" | null;
+}
+
 export interface ScanResult {
   status: string;
-  classified: {
-    input_name: string;
-    matched_item: string | null;
-    category: string | null;
-    retailer: string | null;
-    is_healthy: boolean;
-  }[];
+  classified: ClassifiedItem[];
   inserted_items: { item_name: string; category: string }[];
   healthy_count: number;
+  unhealthy_count?: number;
+  exempt_count?: number;
   total_count: number;
+  saved_to_pantry?: number;
+  /** False when the catalogue was down — every item will be exempt. */
+  catalogue_available?: boolean;
   points_awarded?: number;
-  message?: string;
+  message?: string | null;
 }
 
 /** An image picked from the camera roll or captured with the camera. */
@@ -182,19 +195,33 @@ export interface ImageAsset {
  * Upload a slip/food photo. Gemini reads the item names, the catalogue
  * classifies them.
  *
- * React Native's FormData takes a {uri, name, type} object rather than a Blob,
- * which is why this doesn't look like the web version. The cast is required
- * because the DOM typings for FormData.append don't describe RN's shape.
+ * The two platforms need genuinely different FormData payloads:
+ *
+ *   native - React Native's FormData takes a {uri, name, type} object and
+ *            streams the file off disk itself. The cast is needed because the
+ *            DOM typings for append() don't describe that shape.
+ *
+ *   web    - react-native-web hands through the browser's real FormData, which
+ *            requires a Blob. The picker and the camera both give us a blob:
+ *            or data: URI there, so we fetch it back into a Blob first.
+ *            Appending the native object shape on web silently serialises to
+ *            "[object Object]" and the backend receives an empty upload.
  */
 export async function scanSlip(userId: string, asset: ImageAsset): Promise<ScanResult> {
   if (!IS_LIVE) throw new ApiError("No EXPO_PUBLIC_API_BASE configured (demo mode)", 0);
 
-  const name = asset.fileName ?? asset.uri.split("/").pop() ?? "slip.jpg";
+  const name = asset.fileName ?? asset.uri.split("/").pop()?.split("?")[0] ?? "slip.jpg";
   const extMatch = /\.(\w+)$/.exec(name);
   const type = asset.mimeType ?? (extMatch ? `image/${extMatch[1]}` : "image/jpeg");
 
   const form = new FormData();
-  form.append("file", { uri: asset.uri, name, type } as unknown as Blob);
+  if (Platform.OS === "web") {
+    const blob = await (await fetch(asset.uri)).blob();
+    const safeName = /\.\w+$/.test(name) ? name : `${name}.jpg`;
+    form.append("file", blob, safeName);
+  } else {
+    form.append("file", { uri: asset.uri, name, type } as unknown as Blob);
+  }
 
   try {
     const res = await client.post<ScanResult>(

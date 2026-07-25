@@ -291,6 +291,29 @@ def get_pantry(user_id: str):
     return {"status": "success", "items": items}
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    """
+    Last line of defence.
+
+    An unhandled 500 is returned by Starlette as plain text with no CORS
+    headers, so the browser reports a misleading CORS violation and the real
+    cause stays hidden in the server log. Returning JSON with the exception
+    type and message makes every failure self-describing.
+    """
+    from fastapi.responses import JSONResponse
+
+    log.exception("unhandled error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "detail": f"{type(exc).__name__}: {str(exc)[:500]}",
+            "path": str(request.url.path),
+        },
+    )
+
+
 @app.post("/api/pantry/scan")
 async def scan_receipt(
     file: UploadFile = File(...),
@@ -336,29 +359,71 @@ async def scan_receipt(
                 "healthy_count": 0, "total_count": 0,
                 "message": "No food items were recognised in that image."}
 
-    classified = catalogue_service.classify_items(bq.get_client(), config.DATASET, names)
+    # Everything past this point talks to BigQuery, and none of it is allowed to
+    # lose the user's scan. Gemini has already done the hard part - reading the
+    # slip - so a BigQuery problem downgrades the response rather than binning it.
+    classified, catalogue_available = catalogue_service.classify_items(
+        bq.get_client(), config.DATASET, names,
+    )
 
-    # Only HealthyFood items go into the pantry - it's a HealthyFood tool, and
-    # we don't want to plan recipes around someone's chocolate bar.
+    # Only verified-healthy items go into the pantry. Exempt items are shown to
+    # the user but not stored, because we can't stand behind them.
     to_store = [{
         "item_name": c["matched_item"] or c["input_name"],
         "category": c["category"] or "Uncategorised",
     } for c in classified if c["is_healthy"]]
 
-    rows, errors = pantry_service.add_items(user_id, to_store)
-    if errors:
-        return {"status": "error", "message": "Failed to insert into BigQuery", "errors": errors}
+    saved = 0
+    pantry_error = None
+    if to_store:
+        try:
+            rows, errors = pantry_service.add_items(user_id, to_store)
+            saved = 0 if errors else len(rows)
+            if errors:
+                pantry_error = "BigQuery rejected the pantry rows."
+        except Exception as exc:  # noqa: BLE001
+            log.exception("pantry insert failed")
+            pantry_error = f"Could not save to your pantry: {str(exc)[:200]}"
 
-    points_service.award(user_id, "slip_scanned")
+    # Points are a nice-to-have; never fail a successful scan over them.
+    points_awarded = 0
+    try:
+        points_service.award(user_id, "slip_scanned")
+        points_awarded = points_service.POINT_VALUES["slip_scanned"]
+    except Exception:  # noqa: BLE001
+        log.warning("points award failed after scan (continuing)")
 
-    healthy_count = sum(1 for c in classified if c["is_healthy"])
+    healthy_count = sum(1 for c in classified if c["status"] == "healthy")
+    unhealthy_count = sum(1 for c in classified if c["status"] == "unhealthy")
+    exempt_count = sum(1 for c in classified if c["status"] == "exempt")
+
+    notes = []
+    if not catalogue_available:
+        notes.append(
+            "The HealthyFood catalogue was unreachable, so nothing could be verified. "
+            "Every item is marked exempt rather than guessed at."
+        )
+    elif exempt_count:
+        notes.append(
+            f"{exempt_count} item(s) aren't in the HealthyFood catalogue, "
+            "so they're exempt rather than judged."
+        )
+    if pantry_error:
+        notes.append(pantry_error)
+
     return {
         "status": "success",
-        "inserted_items": rows,
         "classified": classified,
+        "inserted_items": [{"item_name": t["item_name"], "category": t["category"]}
+                           for t in to_store] if saved else [],
         "healthy_count": healthy_count,
+        "unhealthy_count": unhealthy_count,
+        "exempt_count": exempt_count,
         "total_count": len(classified),
-        "points_awarded": points_service.POINT_VALUES["slip_scanned"],
+        "saved_to_pantry": saved,
+        "catalogue_available": catalogue_available,
+        "points_awarded": points_awarded,
+        "message": " ".join(notes) or None,
     }
 
 

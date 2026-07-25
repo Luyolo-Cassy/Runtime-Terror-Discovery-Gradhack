@@ -27,7 +27,10 @@ def get_client():
     if _client is None:
         from google.cloud import bigquery
         import config
-        _client = bigquery.Client(project=config.PROJECT_ID)
+        # location matters: a client defaulting to the US multi-region cannot
+        # see a dataset in africa-south1, and the error is a confusing 404
+        # "table not found" rather than anything about regions.
+        _client = bigquery.Client(project=config.PROJECT_ID, location=config.BQ_LOCATION)
     return _client
 
 
