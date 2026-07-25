@@ -633,31 +633,20 @@ def claim_reward(req: ClaimRewardRequest):
             detail=f"You need {required - current} more points to claim this reward.",
         )
 
-    claim_id = str(uuid.uuid4())
-    voucher_code = f"HEALTHY-{str(uuid.uuid4())[:8].upper()}"
-    bq.insert(config.CLAIMED_REWARDS, [{
-        "claim_id": claim_id,
-        "user_id": req.user_id,
-        "reward_id": req.reward_id,
-        "voucher_code": voucher_code,
-        "claimed_at": datetime.now().isoformat(),
-        "expires_at": None,
-        "status": "active",
-    }])
-
-    # Redemption is a negative row on the same ledger, so the balance stays
-    # consistent and the claim is auditable.
-    points_service.award(
-        req.user_id, "reward_claimed", amount=-required,
-        badge_name=f"Claimed: {reward.get('reward_name')}",
+    claim_result = points_service.claim_reward(
+        req.user_id,
+        reward.get("reward_name"),
+        required,
     )
+    if claim_result["status"] != "success":
+        raise HTTPException(status_code=500, detail="Could not claim reward")
 
     return {
         "status": "success",
-        "voucher_code": voucher_code,
-        "reward_name": reward.get("reward_name"),
-        "points_spent": required,
-        "message": "Reward claimed successfully!",
+        "voucher_code": claim_result["voucher_code"],
+        "reward_name": claim_result["reward_name"],
+        "points_spent": claim_result["points_spent"],
+        "message": claim_result["message"],
     }
 
 

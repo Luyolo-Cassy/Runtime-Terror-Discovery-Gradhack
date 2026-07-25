@@ -41,6 +41,39 @@ BADGE_RULES = [
 ]
 
 
+def claim_reward(user_id: str, reward_name: str, points_required: int):
+    """Create a voucher claim and deduct the required points from the ledger."""
+    points_required = int(points_required or 0)
+    claim_id = str(uuid.uuid4())
+    voucher_code = f"HEALTHY-{str(uuid.uuid4())[:8].upper()}"
+    row = {
+        "claim_id": claim_id,
+        "user_id": user_id,
+        "reward_id": None,
+        "voucher_code": voucher_code,
+        "claimed_at": datetime.now().isoformat(),
+        "expires_at": None,
+        "status": "active",
+    }
+    errors = bq.insert(config.CLAIMED_REWARDS, [row])
+    award_result = award(
+        user_id,
+        "reward_claimed",
+        amount=-abs(points_required),
+        badge_name=f"Claimed: {reward_name}",
+    )
+    status = "success" if not errors and award_result.get("status") == "success" else "error"
+    return {
+        "status": status,
+        "voucher_code": voucher_code,
+        "reward_name": reward_name,
+        "points_spent": points_required,
+        "message": "Reward claimed successfully!" if status == "success" else "Reward claim failed",
+        "claim_id": claim_id,
+        "errors": errors + award_result.get("errors", []),
+    }
+
+
 def award(user_id: str, reason: str, amount: int = None, badge_name: str = None):
     """
     Append one event to the points ledger.

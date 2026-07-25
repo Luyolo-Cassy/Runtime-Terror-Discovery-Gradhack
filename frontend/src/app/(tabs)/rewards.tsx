@@ -1,39 +1,67 @@
 import React from "react";
 import { StyleSheet, Text, View } from "react-native";
-import { Check, Gift, Lock, Sparkles, Ticket, Trophy, Zap } from "lucide-react-native";
+import { Sparkles, Trophy, Zap } from "lucide-react-native";
 
-import { ActionButton, Card, EmptyState, ProgressBar, Screen, SectionLabel } from "@/components/ui";
+import { Card, ProgressBar, Screen, SectionLabel } from "@/components/ui";
 import { VitalityRing } from "@/components/vitality-ring";
 import { Colors, Radius, Spacing, alpha } from "@/constants/theme";
 import { useApp } from "@/data/store";
-import type { Reward } from "@/data/mockData";
 
 export default function RewardsScreen() {
-  const { state, actions } = useApp();
-  const { profile, points, trend, badges, challenges, rewards, vouchers } = state;
+  const { state } = useApp();
+  const { profile, points, trend, badges, challenges } = state;
 
-  // Progress toward the next reward they can't yet afford — more motivating
-  // than an arbitrary "points modulo 2000" ring.
-  const nextReward = [...rewards]
-    .sort((a, b) => a.points_required - b.points_required)
-    .find((r) => r.points_required > points);
+  const nextReward = challenges.find((challenge) => !challenge.done);
   const ringValue = nextReward
-    ? Math.min(100, Math.round((points / nextReward.points_required) * 100))
+    ? Math.min(100, Math.round(((nextReward.have ?? 0) / Math.max(nextReward.target ?? 1, 1)) * 100))
     : 100;
+
+  const goalRewards = [
+    {
+      id: "healthy-choice",
+      title: "Healthy choices streak",
+      reward: "Vitality boost",
+      description: "Unlocked when you keep choosing healthier baskets, swaps, and recipes.",
+      unlocked: badges.some((badge) => badge.earned) || challenges.some((challenge) => challenge.done),
+      detail: badges.some((badge) => badge.earned) || challenges.some((challenge) => challenge.done)
+        ? "You are building a strong healthy-living pattern."
+        : "Keep going with healthier purchases and meal decisions.",
+    },
+    {
+      id: "financial-wellness",
+      title: "Financial wellness goal",
+      reward: "Cashback uplift",
+      description: "Unlocked when your healthy-spend trend stays strong and your pantry choices stay intentional.",
+      unlocked: profile.healthScore >= 60 || trend.some((month) => month.healthy >= 60),
+      detail: profile.healthScore >= 60 || trend.some((month) => month.healthy >= 60)
+        ? "Your spending pattern is supporting both wellness and value."
+        : "A stronger healthy-share of spend will unlock this reward.",
+    },
+    {
+      id: "zero-waste",
+      title: "Zero-waste cooking goal",
+      reward: "Healthy habit bonus",
+      description: "Unlocked when you use expiring items and cook more sustainably.",
+      unlocked: badges.some((badge) => badge.id === "b-waste" && badge.earned) || challenges.some((challenge) => challenge.id === "c-waste" && challenge.done),
+      detail: badges.some((badge) => badge.id === "b-waste" && badge.earned) || challenges.some((challenge) => challenge.id === "c-waste" && challenge.done)
+        ? "You are turning food waste into a healthier habit."
+        : "Try a zero-waste recipe to unlock this reward.",
+    },
+  ];
 
   return (
     <Screen title="Your Rewards" subtitle={`${profile.tier} tier · powered by Vitality`}>
       <View style={styles.cashback}>
         <View style={styles.cashbackHead}>
-          <Text style={styles.cashbackKicker}>HEALTHYFOOD CASHBACK</Text>
+          <Text style={styles.cashbackKicker}>DISCOVERY MILES</Text>
           <Trophy size={18} color={Colors.goldFg} />
         </View>
         <View style={styles.cashbackValueRow}>
           <Text style={styles.cashbackValue}>{profile.cashbackPercent}%</Text>
-          <Text style={styles.cashbackTier}>{profile.tier} tier</Text>
+          <Text style={styles.cashbackTier}>back in Discovery Miles</Text>
         </View>
         <View style={styles.cashbackFoot}>
-          <Text style={styles.cashbackFootLabel}>Est. back on an average basket</Text>
+          <Text style={styles.cashbackFootLabel}>Est. back on an average basket · {profile.tier} tier</Text>
           <Text style={styles.cashbackFootValue}>R{profile.cashbackMonth.toFixed(2)}</Text>
         </View>
       </View>
@@ -52,49 +80,34 @@ export default function RewardsScreen() {
             <Sparkles size={14} color={Colors.vitality} />
             <Text style={styles.vitalityText}>
               {nextReward
-                ? `${(nextReward.points_required - points).toLocaleString()} to go`
-                : "Everything unlocked"}
+                ? `${nextReward.have ?? 0}/${nextReward.target ?? 1} toward the next goal`
+                : "All goals are on track"}
             </Text>
           </View>
           <Text style={styles.body}>
-            {nextReward ? `Next up: ${nextReward.reward_name}.` : "You can claim any reward in the catalogue."}
+            {nextReward
+              ? `Keep building healthy habits to unlock the next Vitality reward.`
+              : "Your recent choices are already helping you reach your goals."}
           </Text>
         </View>
       </Card>
 
-      {vouchers.length > 0 ? (
-        <>
-          <SectionLabel>Your vouchers</SectionLabel>
-          {vouchers.map((v) => (
-            <Card key={v.code} style={styles.voucher}>
+      <SectionLabel>Goal-based Vitality rewards</SectionLabel>
+      {goalRewards.map((reward) => (
+        <Card key={reward.id} style={[styles.voucher, reward.unlocked ? styles.voucherUnlocked : null]}>
+          <View style={styles.rowHead}>
+            <View style={styles.flex}>
               <View style={styles.inlineRow}>
-                <Ticket size={18} color={Colors.vitality} />
-                <View style={styles.flex}>
-                  <Text style={styles.itemName} numberOfLines={1}>{v.rewardName}</Text>
-                  <Text style={styles.voucherCode}>{v.code}</Text>
-                </View>
+                <Sparkles size={15} color={reward.unlocked ? Colors.vitality : Colors.muted} />
+                <Text style={styles.itemName} numberOfLines={1}>{reward.title}</Text>
               </View>
-            </Card>
-          ))}
-        </>
-      ) : null}
-
-      <SectionLabel>Redeem your points</SectionLabel>
-      {rewards.map((r) => (
-        <RewardCard
-          key={r.reward_id}
-          reward={r}
-          points={points}
-          busy={Boolean(state.busy[`reward-${r.reward_id}`])}
-        />
+              <Text style={styles.body}>{reward.description}</Text>
+            </View>
+            <Text style={[styles.reward, reward.unlocked ? styles.rewardUnlocked : null]}>{reward.reward}</Text>
+          </View>
+          <Text style={styles.meta}>{reward.detail}</Text>
+        </Card>
       ))}
-      {rewards.length === 0 && !state.loading ? (
-        <EmptyState
-          icon={<Gift size={24} color={Colors.muted} />}
-          title="No rewards available"
-          hint="The rewards catalogue is empty or unreachable right now."
-        />
-      ) : null}
 
       <SectionLabel>Challenges</SectionLabel>
       {challenges.map((ch) => (
@@ -115,13 +128,11 @@ export default function RewardsScreen() {
             <Text style={styles.meta}>{ch.have ?? 0} of {ch.target} done</Text>
           ) : null}
 
-          <ActionButton
-            label={ch.done ? `Claim ${ch.reward} pts` : "In progress"}
-            icon={ch.done ? <Check size={13} color={Colors.vitalityFg} /> : undefined}
-            variant={ch.done ? "primary" : "muted"}
-            onPress={() => actions.completeChallenge(ch)}
-            style={styles.challengeButton}
-          />
+          <View style={styles.challengeStatusWrap}>
+            <Text style={[styles.challengeStatus, ch.done ? styles.challengeStatusDone : null]}>
+              {ch.done ? "Goal reached" : "In progress"}
+            </Text>
+          </View>
         </Card>
       ))}
 
@@ -170,58 +181,11 @@ export default function RewardsScreen() {
                 : styles.badgeLocked,
             ]}
           >
-            <Text style={styles.badgeIcon}>{b.icon}</Text>
             <Text style={styles.badgeName}>{b.name}</Text>
-            <Text style={styles.badgeDesc}>{b.desc}</Text>
-            {!b.earned && b.progress != null && b.progress > 0 ? (
-              <View style={styles.badgeProgress}>
-                <ProgressBar value={b.progress} color={Colors.vitality} />
-              </View>
-            ) : null}
           </View>
         ))}
       </View>
     </Screen>
-  );
-}
-
-function RewardCard({ reward, points, busy }: { reward: Reward; points: number; busy: boolean }) {
-  const { actions } = useApp();
-  const affordable = points >= reward.points_required;
-  const shortfall = reward.points_required - points;
-
-  return (
-    <Card style={affordable ? { borderColor: alpha(Colors.vitality, 0.45) } : undefined}>
-      <View style={styles.rowHead}>
-        <View style={styles.flex}>
-          <Text style={styles.itemName} numberOfLines={1}>{reward.reward_name}</Text>
-          <Text style={styles.body}>
-            {reward.partner_name ?? "Discovery"}
-            {reward.reward_type ? ` · ${reward.reward_type}` : ""}
-          </Text>
-        </View>
-        <View style={styles.pointsCol}>
-          <Text style={styles.pointsValue}>{reward.points_required.toLocaleString()}</Text>
-          <Text style={styles.kicker}>POINTS</Text>
-        </View>
-      </View>
-
-      {!affordable ? (
-        <ProgressBar value={(points / reward.points_required) * 100} color={Colors.primary} />
-      ) : null}
-
-      <ActionButton
-        label={affordable ? "Claim reward" : `${shortfall.toLocaleString()} points to go`}
-        icon={affordable
-          ? <Gift size={15} color={Colors.goldFg} />
-          : <Lock size={14} color={Colors.muted} />}
-        variant={affordable ? "gold" : "muted"}
-        onPress={() => actions.claimReward(reward)}
-        disabled={!affordable}
-        busy={busy}
-        style={{ marginTop: Spacing.md }}
-      />
-    </Card>
   );
 }
 
@@ -235,7 +199,8 @@ const styles = StyleSheet.create({
   meta: { fontSize: 11, color: Colors.muted, marginTop: 4 },
   itemName: { fontSize: 14, fontWeight: "700", color: Colors.foreground, flexShrink: 1 },
   vitalityText: { fontSize: 13, fontWeight: "700", color: Colors.vitality },
-  reward: { fontSize: 12, fontWeight: "800", color: Colors.vitality },
+  reward: { fontSize: 12, fontWeight: "800", color: Colors.muted },
+  rewardUnlocked: { color: Colors.vitality },
 
   cashback: {
     backgroundColor: Colors.gold, borderRadius: Radius.xl, padding: Spacing.xl,
@@ -254,16 +219,23 @@ const styles = StyleSheet.create({
   cashbackFootValue: { fontSize: 13, fontWeight: "700", color: Colors.goldFg },
 
   voucher: {
+    borderColor: alpha(Colors.border, 0.45),
+    backgroundColor: Colors.surface,
+    padding: Spacing.md,
+    marginBottom: Spacing.sm,
+  },
+  voucherUnlocked: {
     borderColor: alpha(Colors.vitality, 0.45),
     backgroundColor: alpha(Colors.vitality, 0.07),
-    padding: Spacing.md,
   },
   voucherCode: { fontSize: 12, fontWeight: "700", color: Colors.vitality, marginTop: 2 },
 
   pointsCol: { alignItems: "flex-end" },
   pointsValue: { fontSize: 14, fontWeight: "800", color: Colors.foreground },
 
-  challengeButton: { marginTop: Spacing.md, alignSelf: "flex-start", paddingVertical: 10 },
+  challengeStatusWrap: { marginTop: Spacing.md, alignSelf: "flex-start" },
+  challengeStatus: { fontSize: 12, fontWeight: "700", color: Colors.muted },
+  challengeStatusDone: { color: Colors.vitality },
 
   chart: { flexDirection: "row", gap: Spacing.lg, height: 168 },
   chartCol: { flex: 1, alignItems: "center" },
