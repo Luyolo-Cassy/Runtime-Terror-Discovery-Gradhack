@@ -49,6 +49,25 @@ Return ONLY valid JSON in this shape, with no markdown fences or extra text:
 }}
 """
 
+# ── Recipe length options ────────────────────────────────────────────────
+# Keeping wording here (not inline in the route) makes it easy to tune
+# without touching endpoint logic. If Gemini doesn't respect the numeric
+# limits during testing, tighten the wording (e.g. add "STRICT maximum").
+LENGTH_INSTRUCTIONS = {
+    "short": (
+        "Keep this recipe SHORT and simple: no more than 5 ingredients "
+        "and no more than 4 steps. Prioritize quick, low-effort meals."
+    ),
+    "long": (
+        "Make this a more DETAILED recipe: include richer ingredient variety "
+        "and 6-10 clear steps, with brief technique notes where useful "
+        "(e.g. how to tell when something is cooked)."
+    ),
+}
+DEFAULT_LENGTH_INSTRUCTION = (
+    "Use a standard recipe length: roughly 5-8 ingredients and 4-6 steps."
+)
+
 
 def get_catalogue_items(item_names: list[str]) -> list[dict]:
     """
@@ -84,6 +103,11 @@ def get_recipe():
     matched_item_names = data.get("matched_items", [])
     pantry_items = data.get("pantry_items", [])
 
+    # NEW: user-selected recipe length, defaults to "standard" if omitted
+    # or if an unrecognized value is sent (e.g. frontend bug, bad input).
+    recipe_length = data.get("recipe_length", "standard")
+    length_instruction = LENGTH_INSTRUCTIONS.get(recipe_length, DEFAULT_LENGTH_INSTRUCTION)
+
     catalogue_items = get_catalogue_items(matched_item_names)
 
     # Guard: if item-matching missed everything, don't hard-fail —
@@ -94,6 +118,7 @@ def get_recipe():
     prompt = PROMPT_TEMPLATE.format(
         catalogue_items=json.dumps(catalogue_items),
         pantry_items=json.dumps(pantry_items),
+        length_instruction=length_instruction,
     )
 
     response = client.models.generate_content(
