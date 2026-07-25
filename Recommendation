@@ -18,10 +18,17 @@ client = genai.Client(
 )
 
 # ── BigQuery client ───────────────────────────────────────────────────────
-# Uses the same Application Default Credentials as the Gemini client —
-# no separate auth needed, as long as the service account/user has
-# BigQuery read access on the dataset below.
-bq_client = bigquery.Client()
+# NOTE: BigQuery client now explicitly pinned to "africa-south1" to match
+# the Gemini client's region. If your BigQuery DATASET itself is not
+# actually located in africa-south1 (check in the BigQuery console —
+# dataset location is set at creation and can't be changed after), this
+# will cause query errors, since BigQuery jobs must run in the same
+# region/multi-region as the dataset they're querying. Confirm with
+# Person 1 before relying on this.
+bq_client = bigquery.Client(
+    project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+    location="africa-south1",
+)
 
 # CONFIRM with Person 1: "Runtime-Terror-gradhack26jnb" may be a display
 # name rather than the real GCP project ID — double check before demo day,
@@ -40,12 +47,19 @@ User's pantry contents:
 
 {length_instruction}
 
+Return between 3 and 5 recipes, ordered from best match to worst match for the
+user's pantry and catalogue items above. Ensure the recipes are meaningfully
+different from each other (different primary ingredients or cooking methods).
 Return ONLY valid JSON in this shape, with no markdown fences or extra text:
 {{
-  "recipe_title": string,
-  "ingredients_used": [string],
-  "ingredients_missing": [string],
-  "steps": [string]
+  "recipes": [
+    {{
+      "recipe_title": string,
+      "ingredients_used": [string],
+      "ingredients_missing": [string],
+      "steps": [string]
+    }}
+  ]
 }}
 """
 
@@ -55,17 +69,17 @@ Return ONLY valid JSON in this shape, with no markdown fences or extra text:
 # limits during testing, tighten the wording (e.g. add "STRICT maximum").
 LENGTH_INSTRUCTIONS = {
     "short": (
-        "Keep this recipe SHORT and simple: no more than 5 ingredients "
+        "Keep EACH recipe SHORT and simple: no more than 5 ingredients "
         "and no more than 4 steps. Prioritize quick, low-effort meals."
     ),
     "long": (
-        "Make this a more DETAILED recipe: include richer ingredient variety "
+        "Make EACH recipe more DETAILED: include richer ingredient variety "
         "and 6-10 clear steps, with brief technique notes where useful "
         "(e.g. how to tell when something is cooked)."
     ),
 }
 DEFAULT_LENGTH_INSTRUCTION = (
-    "Use a standard recipe length: roughly 5-8 ingredients and 4-6 steps."
+    "Use a standard recipe length for each recipe: roughly 5-8 ingredients and 4-6 steps."
 )
 
 
@@ -96,22 +110,14 @@ def get_catalogue_items(item_names: list[str]) -> list[dict]:
 def get_recipe():
     data = request.get_json()
 
-    # CHANGED: caller now sends matched item NAMES (strings), not full
-    # catalogue objects — this endpoint does the BigQuery lookup itself
-    # so the "grounding" data always comes from the real table, not
-    # whatever the frontend happens to pass in.
     matched_item_names = data.get("matched_items", [])
     pantry_items = data.get("pantry_items", [])
 
-    # NEW: user-selected recipe length, defaults to "standard" if omitted
-    # or if an unrecognized value is sent (e.g. frontend bug, bad input).
     recipe_length = data.get("recipe_length", "standard")
     length_instruction = LENGTH_INSTRUCTIONS.get(recipe_length, DEFAULT_LENGTH_INSTRUCTION)
 
     catalogue_items = get_catalogue_items(matched_item_names)
 
-    # Guard: if item-matching missed everything, don't hard-fail —
-    # let Gemini proceed on pantry alone rather than breaking the demo.
     if not catalogue_items:
         catalogue_items = []
 
@@ -127,14 +133,17 @@ def get_recipe():
     )
 
     try:
-        recipe_json = json.loads(response.text)
+        parsed = json.loads(response.text)
+        recipes = parsed.get("recipes", [])
+        if not recipes:
+            return jsonify({"error": "model returned no recipes", "raw": response.text}), 502
     except json.JSONDecodeError:
         return jsonify({"error": "model returned invalid JSON", "raw": response.text}), 502
 
-    # MISSING in your original — the success path needs an explicit return.
-    return jsonify(recipe_json)
+    return jsonify({"recipes": recipes})
 
 
 if __name__ == "__main__":
-    # Cloud Run injects PORT automatically; 8080 is the local fallback.
+    # Cloud Run injects PORT automatically at deploy time; 8081 is the
+    # local dev fallback if PORT isn't set in the environment.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8081)))
