@@ -94,6 +94,7 @@ class GenerateRecipeRequest(BaseModel):
     user_id: str = config.DEFAULT_USER
     # When true, the recipe is built around items that are about to expire.
     zero_waste: bool = False
+    recipe_length: str = "standard"  
 
 
 class ClaimRewardRequest(BaseModel):
@@ -455,7 +456,8 @@ def generate_recipe(req: GenerateRecipeRequest):
 
     try:
         result = recipe_service.generate_personalized_recipe(
-            bq.get_client(), get_model(), config.DATASET, req.user_id, focus_items=focus
+            bq.get_client(), get_model(), config.DATASET, req.user_id,
+            focus_items=focus, recipe_length=req.recipe_length   # NEW
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Recipe generation failed: {str(exc)[:200]}")
@@ -485,6 +487,7 @@ def generate_recipe(req: GenerateRecipeRequest):
         "missing_ingredients": result["missing_ingredients"],
         "used_pantry_items": result.get("used_pantry_items", []),
         "focus_items": focus,
+        "recipe_length": result.get("recipe_length"),   # NEW — echo it back
         "personalized_for": result["personalized_for"],
         "points_awarded": points_service.POINT_VALUES[reason],
     }
