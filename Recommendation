@@ -14,7 +14,7 @@ from google.cloud import bigquery
 client = genai.Client(
     vertexai=True,
     project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
-    location="us-central1",
+    location="africa-south1",
 )
 
 # ── BigQuery client ───────────────────────────────────────────────────────
