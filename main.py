@@ -7,25 +7,29 @@ app = Flask(__name__)
 bq = bigquery.Client()
 
 TABLE = "gradhack26jnb-408.HealthyFood.dataset"
-PREFERENCES_TABLE = "gradhack26jnb-408.HealthyFood.user_preferences"
-UNHEALTHY_CATEGORY = "Unhealthy foods"
 
-# Fields a user is allowed to explicitly override on their profile.
-OVERRIDABLE_FIELDS = {"goal", "inferred_budget_tier", "preferred_retailer"}
+# Person 1 (Alessio)'s precomputed profile view — this is now the source of
+# truth for GET /profile/<user_id>, replacing our own in-Python computation.
+PROFILE_VIEW = "gradhack26jnb-408.HealthyFood.user_profiles"
+
+PREFERENCES_TABLE = "gradhack26jnb-408.HealthyFood.user_preferences"
+
+# Fields a user is allowed to explicitly override. Only fields that are both
+# present in the fetched profile row AND in this set will ever be changed.
+OVERRIDABLE_FIELDS = {"goal", "budget_tier", "preferred_category", "preferred_retailer"}
+
+UNHEALTHY_CATEGORY = "Unhealthy foods"
 
 
 def get_declared_overrides(user_id: str) -> dict:
     """
     Reads any explicitly declared preferences for this user and returns
     only the fields that are non-null, i.e. the ones the user actually set.
-
-    Assumes a table with one row per user, one column per overridable field.
-    Un-set preferences are stored as NULL rather than an empty row.
     """
     query = f"""
         SELECT
             goal,
-            inferred_budget_tier,
+            budget_tier,
             preferred_retailer
         FROM `{PREFERENCES_TABLE}`
         WHERE `Customer ID` = @user_id
@@ -60,7 +64,41 @@ def get_declared_overrides(user_id: str) -> dict:
     return overrides
 
 
+def fetch_computed_profile(user_id: str) -> dict:
+    """
+    Reads the precomputed profile row from Person 1's `user_profiles` view.
+    We don't assume a fixed schema here (Alessio's code uses SELECT *), so
+    we just pass through whatever columns actually exist on the row.
+    """
+    query = f"""
+        SELECT *
+        FROM `{PROFILE_VIEW}`
+        WHERE customer_id = @user_id
+        LIMIT 1
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("user_id", "STRING", user_id)
+        ]
+    )
+
+    rows = list(bq.query(query, job_config=job_config).result())
+
+    if not rows:
+        return {}
+
+    # dict(row) pulls back every column the view actually has, whatever
+    # they're named, so this doesn't break if the view's schema changes.
+    return dict(rows[0])
+
+
 def fetch_purchase_history(user_id: str, basket_limit: int = None):
+    """
+    Still needed for /profile/<user_id>/evolution: the precomputed view is a
+    single fixed row over full history, so it can't show a "first 3 baskets"
+    checkpoint. Evolution keeps computing directly from raw transactions.
+    """
     query = f"""
         SELECT
             `Basket ID` AS basket_id,
@@ -101,6 +139,10 @@ def fetch_purchase_history(user_id: str, basket_limit: int = None):
 
 
 def build_profile(rows) -> dict:
+    """
+    Local fallback profile computation, used only by /evolution now that
+    the main endpoint reads from Person 1's precomputed view.
+    """
     if not rows:
         return {
             "spend_by_category": {},
@@ -172,8 +214,8 @@ def build_profile(rows) -> dict:
 
 def apply_overrides(profile: dict, overrides: dict) -> dict:
     """
-    Declared preferences win over inferred values, but only for fields
-    that are both overridable and present in the profile schema.
+    Declared preferences win over inferred/precomputed values, but only for
+    fields that are both overridable and already present in the profile.
     """
     for field, value in overrides.items():
         if field in OVERRIDABLE_FIELDS and field in profile:
@@ -188,8 +230,18 @@ def health():
 
 @app.route("/profile/<user_id>")
 def get_profile(user_id):
-    rows = fetch_purchase_history(user_id)
-    profile = build_profile(rows)
+    profile = fetch_computed_profile(user_id)
+
+    if not profile:
+        return jsonify({
+            "user_id": user_id,
+            "error": "No profile found in user_profiles view for this user."
+        }), 404
+
+    # goal isn't part of Person 1's view — keep it as our own field so
+    # Recipes' alternative-suggestion step still has something to read.
+    profile.setdefault("goal", "")
+
     overrides = get_declared_overrides(user_id)
     profile = apply_overrides(profile, overrides)
 
