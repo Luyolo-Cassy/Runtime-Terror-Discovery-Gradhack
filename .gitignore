@@ -11,11 +11,11 @@ __pycache__/
 *.py[cod]
 
 # Service account keys / secrets
-*.json
-!app.json
-!firebase.json
+# NOTE: do NOT use a blanket *.json here — it hides package.json, tsconfig.json,
+# package-lock.json and other config the project needs. Target secrets only:
 *service-account*.json
 *key*.json
+*credentials*.json
 *.pem
 *.p12
 
