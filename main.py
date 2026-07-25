@@ -61,22 +61,24 @@ def get_declared_overrides(user_id: str) -> dict:
 
 
 def fetch_purchase_history(user_id: str, basket_limit: int = None):
-    # Column names confirmed against the team's real BigQuery schema
-    # (see backend/main.py on the Leruo+Alessio_Merge branch):
-    # `Purchase date` (lowercase "date") and `Line total (ZAR)`, already
-    # numeric — not `Purchase Date` / `Line total` as originally assumed.
+    # Column names confirmed directly against BigQuery's schema for this table
+    # (bq show --schema gradhack26jnb-408:HealthyFood.dataset):
+    # `Purchase Date` and `Line total` (STRING, needs casting) are correct.
+    # Note: the team's merged branch queries a different, reformatted table
+    # (config.RAW_TRANSACTIONS) with different column names/types — don't
+    # copy column names across the two without checking the actual table.
     query = f"""
         SELECT
             `Basket ID` AS basket_id,
-            `Purchase date` AS purchase_date,
+            `Purchase Date` AS purchase_date,
             Retailer AS retailer,
             `Main category` AS category,
             `Section subcategory` AS subcategory,
             Quantity AS quantity,
-            `Line total (ZAR)` AS line_total
+            SAFE_CAST(REPLACE(`Line total`, ',', '.') AS FLOAT64) AS line_total
         FROM `{TABLE}`
         WHERE `Customer ID` = @user_id
-        ORDER BY `Purchase date` ASC
+        ORDER BY `Purchase Date` ASC
     """
 
     job_config = bigquery.QueryJobConfig(
