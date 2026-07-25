@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+.venv/
+
+# Credentials — never commit these
+*.json
+!package.json
+!package-lock.json
+.env
+.env.*
+*serviceaccount*
+*service-account*
+*credentials*
+
+# OS/editor junk
+.DS_Store
+.vscode/
+.idea/
