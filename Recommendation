@@ -1,9 +1,113 @@
+import os
+import json
+from flask import Flask, request, jsonify
 from google import genai
-from google.genai.types import HttpOptions
+from google.cloud import bigquery
 
-client = genai.Client(http_options=HttpOptions(api_version="v1"))
-response = client.models.generate_content(
-    model='gemini-3.6-flash',
-    contents='How does AI work?',
+# ── Vertex AI Gemini client ──────────────────────────────────────────────
+# NOTE: only ONE client is needed. Your original file created a second,
+# non-Vertex client (genai.Client(http_options=...)) and ran a test call
+# at import time — that would fire on every Cloud Run cold start using the
+# wrong client/credentials and could crash startup. Removed. If you want
+# to sanity-check the Gemini connection locally, run it manually in a
+# separate script, not inside main.py.
+client = genai.Client(
+    vertexai=True,
+    project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+    location="us-central1",
 )
-print(response.text)
+
+# ── BigQuery client ───────────────────────────────────────────────────────
+# Uses the same Application Default Credentials as the Gemini client —
+# no separate auth needed, as long as the service account/user has
+# BigQuery read access on the dataset below.
+bq_client = bigquery.Client()
+
+# CONFIRM with Person 1: "Runtime-Terror-gradhack26jnb" may be a display
+# name rather than the real GCP project ID — double check before demo day,
+# since a mismatch here will fail silently as a "table not found" error.
+TABLE_REF = "gradhack26jnb-408.HealthyFood.foodCatalogue"
+
+app = Flask(__name__)
+
+PROMPT_TEMPLATE = """You are a recipe assistant. You will only use items marked as healthy in `classification` below, unless the user's pantry requires otherwise.
+
+Catalogue items (from foodCatalogue — retailer, category, subcategory, item_name, item_type, classification):
+{catalogue_items}
+
+User's pantry contents:
+{pantry_items}
+
+Return ONLY valid JSON in this shape, with no markdown fences or extra text:
+{{
+  "recipe_title": string,
+  "ingredients_used": [string],
+  "ingredients_missing": [string],
+  "steps": [string]
+}}
+"""
+
+
+def get_catalogue_items(item_names: list[str]) -> list[dict]:
+    """
+    Given matched item names (from Person 1's till-slip matching step),
+    look up their real category/classification from BigQuery so Gemini
+    is grounded on actual catalogue data instead of guessing.
+    """
+    if not item_names:
+        return []
+
+    query = f"""
+        SELECT retailer, category, subcategory, item_name, item_type, classification
+        FROM `{TABLE_REF}`
+        WHERE item_name IN UNNEST(@item_names)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("item_names", "STRING", item_names)
+        ]
+    )
+    results = bq_client.query(query, job_config=job_config).result()
+    return [dict(row) for row in results]
+
+
+@app.route("/recipes", methods=["POST"])
+def get_recipe():
+    data = request.get_json()
+
+    # CHANGED: caller now sends matched item NAMES (strings), not full
+    # catalogue objects — this endpoint does the BigQuery lookup itself
+    # so the "grounding" data always comes from the real table, not
+    # whatever the frontend happens to pass in.
+    matched_item_names = data.get("matched_items", [])
+    pantry_items = data.get("pantry_items", [])
+
+    catalogue_items = get_catalogue_items(matched_item_names)
+
+    # Guard: if item-matching missed everything, don't hard-fail —
+    # let Gemini proceed on pantry alone rather than breaking the demo.
+    if not catalogue_items:
+        catalogue_items = []
+
+    prompt = PROMPT_TEMPLATE.format(
+        catalogue_items=json.dumps(catalogue_items),
+        pantry_items=json.dumps(pantry_items),
+    )
+
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+    )
+
+    try:
+        recipe_json = json.loads(response.text)
+    except json.JSONDecodeError:
+        return jsonify({"error": "model returned invalid JSON", "raw": response.text}), 502
+
+    # MISSING in your original — the success path needs an explicit return.
+    return jsonify(recipe_json)
+
+
+if __name__ == "__main__":
+    # Cloud Run injects PORT automatically; 8080 is the local fallback.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
