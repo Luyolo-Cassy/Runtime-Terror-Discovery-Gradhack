@@ -1,0 +1,5 @@
+frontend/
+backend/
+.git/
+__pycache__/
+*.pyc

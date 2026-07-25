@@ -8,16 +8,17 @@ venv/
 .venv/
 
 # Credentials — never commit these
-*.json
-!package.json
-!package-lock.json
 .env
 .env.*
 *serviceaccount*
 *service-account*
 *credentials*
+*.pem
+*.key
+
 
 # OS/editor junk
 .DS_Store
 .vscode/
 .idea/
+backend/__pycache__/
