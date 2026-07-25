@@ -1,24 +1,24 @@
-# Node
-node_modules/
-
-# Env files
-.env
-.env.*
-!.env.example
-
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+.venv/
 
-# Service account keys / secrets
-*.json
-!app.json
-!firebase.json
-*service-account*.json
-*key*.json
+# Credentials — never commit these
+.env
+.env.*
+*serviceaccount*
+*service-account*
+*credentials*
 *.pem
-*.p12
+*.key
 
-# OS/editor noise
+
+# OS/editor junk
 .DS_Store
 .vscode/
+.idea/
+backend/__pycache__/

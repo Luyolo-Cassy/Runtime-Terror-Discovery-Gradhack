@@ -1,0 +1,793 @@
+"""
+HealthyFood Companion API
+-------------------------
+FastAPI backend for the Discovery Gradhack HealthyFood Companion.
+
+Design notes for the team:
+
+  * Clients are LAZY (bq.get_client / get_model), so the app imports and boots
+    with no GCP credentials on the machine. Nothing calls Google Cloud until an
+    endpoint that needs data is hit.
+
+  * The catalogue is the source of truth for "is this healthy", not the LLM.
+    Gemini reads item names off a photo (what it's good at); catalogue_service
+    decides which of those names are HealthyFood.
+
+  * Every read path that is nice-to-have rather than essential is wrapped so a
+    missing table degrades one card in the UI instead of failing the screen.
+    A live demo should never show a stack trace.
+
+  * GET /api/home/{user_id} hydrates the entire app in one round trip. The
+    frontend calls that on load rather than firing eight requests.
+"""
+
+import json
+import logging
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+import bootstrap
+import bq
+import catalogue_service
+import config
+import insights_service
+import pantry_service
+import points_service
+import receipts_service
+import recipe_service
+import shopping_service
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("healthyfood")
+
+app = FastAPI(
+    title="HealthyFood Companion API",
+    description="Discovery Gradhack 2026 - Theme 2, AI for Smarter Everyday Living",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    # With credentials off we can safely allow any origin, which saves the team
+    # from chasing CORS errors when the demo moves to a tunnel or Cloud Run URL.
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ==========================================
+# LAZY GEMINI CLIENT
+# ==========================================
+_model = None
+
+
+def get_model():
+    global _model
+    if _model is None:
+        import gemini_client
+        _model = gemini_client.VertexGemini(
+            config.PROJECT_ID, config.LOCATION, config.MODEL_NAME
+        )
+    return _model
+
+
+@app.on_event("startup")
+def _startup():
+    """Create the tables we write to, if they're missing. Never fatal."""
+    try:
+        bootstrap.ensure_tables()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bootstrap skipped: %s", exc)
+
+
+# ==========================================
+# SCHEMAS
+# ==========================================
+class GenerateRecipeRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    # When true, the recipe is built around items that are about to expire.
+    zero_waste: bool = False
+
+
+class ClaimRewardRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    reward_id: str
+
+
+class PantryItemRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    item_name: str
+    category: Optional[str] = None
+
+
+class PantryIdRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    pantry_item_id: str
+
+
+class SubstituteRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    pantry_item_id: str
+    new_name: str
+    new_category: Optional[str] = None
+
+
+class ImportBasketRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    basket_id: str
+    healthy_only: bool = True
+
+
+class ShoppingAddRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    items: list = []
+    recipe_name: Optional[str] = None
+    for_future: bool = False
+
+
+class ShoppingIdRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    shopping_item_id: str
+
+
+class AwardPointsRequest(BaseModel):
+    user_id: str = config.DEFAULT_USER
+    reason: str
+    amount: Optional[int] = None
+
+
+# ==========================================
+# HEALTH
+# ==========================================
+@app.get("/")
+def read_root():
+    return {
+        "message": "HealthyFood Companion API is running!",
+        "dataset": config.DATASET,
+        "model": config.MODEL_NAME,
+    }
+
+
+# ==========================================
+# PROFILE
+# ==========================================
+def _profile_nudge(pct):
+    if not isinstance(pct, (int, float)):
+        return "Scan a receipt to start building your healthy-eating profile."
+    if pct >= 0.6:
+        return "Great work - most of your basket is HealthyFood. Keep it up!"
+    if pct >= 0.3:
+        return "You're on your way. A few healthy swaps could push you higher."
+    return "There's room to grow your HealthyFood share - try a recipe below."
+
+
+def _load_profile(user_id: str):
+    """The computed profile row, or None. Shared by /api/profile and /api/home."""
+    rows = bq.select(
+        f"SELECT * FROM `{config.USER_PROFILES}` WHERE customer_id = @user_id",
+        user_id=user_id,
+    )
+    return rows[0] if rows else None
+
+
+@app.get("/api/profile/{user_id}")
+def get_user_profile(user_id: str):
+    profile = _load_profile(user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    pct = profile.get("healthy_spend_pct")
+    return {
+        "status": "success",
+        "data": profile,
+        "insights": {
+            "headline_category": profile.get("preferred_category"),
+            "budget_tier": profile.get("budget_tier"),
+            "healthy_spend_label": (f"{float(pct):.0%}" if isinstance(pct, (int, float)) else None),
+            "nudge": _profile_nudge(pct),
+        },
+    }
+
+
+@app.get("/api/profile/{user_id}/evolution")
+def get_profile_evolution(user_id: str, first_n_baskets: int = Query(3, ge=1, le=20)):
+    """
+    The same profile computed two ways: on the customer's first few baskets
+    ("new user") versus their whole history ("established").
+
+    This is requirement 4.4 made visible - it shows the judges that the profile
+    genuinely develops with data rather than being a static field on a row.
+    """
+    def _profile_over(limit_baskets=None):
+        limit_clause = ""
+        params = {"user_id": user_id, "unhealthy": config.UNHEALTHY_CATEGORY}
+        if limit_baskets:
+            limit_clause = f"""
+                AND `Basket ID` IN (
+                    SELECT basket_id FROM (
+                        SELECT `Basket ID` AS basket_id,
+                               MIN(`Purchase date`) AS first_seen
+                        FROM `{config.RAW_TRANSACTIONS}`
+                        WHERE `Customer ID` = @user_id
+                        GROUP BY basket_id
+                        ORDER BY first_seen ASC
+                        LIMIT @basket_limit
+                    )
+                )
+            """
+            params["basket_limit"] = limit_baskets
+
+        rows = bq.select(
+            f"""
+            SELECT
+                COUNT(DISTINCT `Basket ID`)                    AS basket_count,
+                SUM(`Line total (ZAR)`)                        AS total_spend,
+                SUM(CASE WHEN `Main category` != @unhealthy
+                         THEN `Line total (ZAR)` ELSE 0 END)   AS healthy_spend
+            FROM `{config.RAW_TRANSACTIONS}`
+            WHERE `Customer ID` = @user_id {limit_clause}
+            """,
+            **params,
+        )
+        agg = rows[0] if rows else {}
+
+        total = float(agg.get("total_spend") or 0)
+        healthy = float(agg.get("healthy_spend") or 0)
+        baskets = int(agg.get("basket_count") or 0)
+        avg_basket = round(total / baskets, 2) if baskets else 0.0
+
+        if avg_basket < 400:
+            tier = "budget"
+        elif avg_basket < 900:
+            tier = "mid"
+        else:
+            tier = "premium"
+
+        top = bq.safe(
+            lambda: bq.select(
+                f"""
+                SELECT `Main category` AS category, SUM(`Line total (ZAR)`) AS spend
+                FROM `{config.RAW_TRANSACTIONS}`
+                WHERE `Customer ID` = @user_id {limit_clause}
+                GROUP BY category ORDER BY spend DESC LIMIT 1
+                """,
+                **params,
+            ),
+            [], "evolution_top_category",
+        )
+
+        return {
+            "basket_count": baskets,
+            "avg_basket_spend": avg_basket,
+            "healthy_spend_pct": round(healthy / total, 3) if total else None,
+            "budget_tier": tier,
+            "preferred_category": top[0]["category"] if top else None,
+        }
+
+    new_user = bq.safe(lambda: _profile_over(first_n_baskets), {}, "evolution_new")
+    established = bq.safe(lambda: _profile_over(None), {}, "evolution_established")
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "new_user_profile": new_user,
+        "established_profile": established,
+    }
+
+
+# ==========================================
+# PANTRY
+# ==========================================
+@app.get("/api/pantry/{user_id}")
+def get_pantry(user_id: str):
+    items = bq.safe(lambda: pantry_service.list_pantry(user_id), [], "list_pantry")
+    return {"status": "success", "items": items}
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    """
+    Last line of defence.
+
+    An unhandled 500 is returned by Starlette as plain text with no CORS
+    headers, so the browser reports a misleading CORS violation and the real
+    cause stays hidden in the server log. Returning JSON with the exception
+    type and message makes every failure self-describing.
+    """
+    from fastapi.responses import JSONResponse
+
+    log.exception("unhandled error on %s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "detail": f"{type(exc).__name__}: {str(exc)[:500]}",
+            "path": str(request.url.path),
+        },
+    )
+
+
+@app.post("/api/pantry/scan")
+async def scan_receipt(
+    file: UploadFile = File(...),
+    user_id: str = Query(config.DEFAULT_USER),
+):
+    """
+    The second ingestion route: a photo of a slip from a non-partner shop, or a
+    photo of the food itself.
+
+    Split of responsibility is deliberate - Gemini extracts item NAMES only, the
+    catalogue decides which of those are HealthyFood. The model never gets to
+    assert that something is healthy.
+    """
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    prompt = """
+    Look at this image (a grocery receipt or a photo of food).
+    Extract every distinct food item you can see.
+    Return ONLY a valid JSON list of strings, e.g.: ["Apples", "Full Cream Milk"]
+    No markdown, no extra text.
+    """
+    import gemini_client
+
+    try:
+        image_part = gemini_client.build_image_part(image_bytes, file.content_type)
+        response = get_model().generate_content([prompt, image_part])
+        raw = (response.text or "").replace("```json", "").replace("```", "").strip()
+        names = json.loads(raw)
+        if not isinstance(names, list):
+            raise ValueError("model did not return a list")
+        names = [str(n) for n in names if str(n).strip()]
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read items off the image: {exc}")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Vision model unavailable: {str(exc)[:200]}")
+
+    if not names:
+        return {"status": "success", "classified": [], "inserted_items": [],
+                "healthy_count": 0, "total_count": 0,
+                "message": "No food items were recognised in that image."}
+
+    # Everything past this point talks to BigQuery, and none of it is allowed to
+    # lose the user's scan. Gemini has already done the hard part - reading the
+    # slip - so a BigQuery problem downgrades the response rather than binning it.
+    classified, catalogue_available = catalogue_service.classify_items(
+        bq.get_client(), config.DATASET, names,
+    )
+
+    # Only verified-healthy items go into the pantry. Exempt items are shown to
+    # the user but not stored, because we can't stand behind them.
+    to_store = [{
+        "item_name": c["matched_item"] or c["input_name"],
+        "category": c["category"] or "Uncategorised",
+    } for c in classified if c["is_healthy"]]
+
+    saved = 0
+    pantry_error = None
+    if to_store:
+        try:
+            rows, errors = pantry_service.add_items(user_id, to_store)
+            saved = 0 if errors else len(rows)
+            if errors:
+                pantry_error = "BigQuery rejected the pantry rows."
+        except Exception as exc:  # noqa: BLE001
+            log.exception("pantry insert failed")
+            pantry_error = f"Could not save to your pantry: {str(exc)[:200]}"
+
+    # Points are a nice-to-have; never fail a successful scan over them.
+    points_awarded = 0
+    try:
+        points_service.award(user_id, "slip_scanned")
+        points_awarded = points_service.POINT_VALUES["slip_scanned"]
+    except Exception:  # noqa: BLE001
+        log.warning("points award failed after scan (continuing)")
+
+    healthy_count = sum(1 for c in classified if c["status"] == "healthy")
+    unhealthy_count = sum(1 for c in classified if c["status"] == "unhealthy")
+    exempt_count = sum(1 for c in classified if c["status"] == "exempt")
+
+    notes = []
+    if not catalogue_available:
+        notes.append(
+            "The HealthyFood catalogue was unreachable, so nothing could be verified. "
+            "Every item is marked exempt rather than guessed at."
+        )
+    elif exempt_count:
+        notes.append(
+            f"{exempt_count} item(s) aren't in the HealthyFood catalogue, "
+            "so they're exempt rather than judged."
+        )
+    if pantry_error:
+        notes.append(pantry_error)
+
+    return {
+        "status": "success",
+        "classified": classified,
+        "inserted_items": [{"item_name": t["item_name"], "category": t["category"]}
+                           for t in to_store] if saved else [],
+        "healthy_count": healthy_count,
+        "unhealthy_count": unhealthy_count,
+        "exempt_count": exempt_count,
+        "total_count": len(classified),
+        "saved_to_pantry": saved,
+        "catalogue_available": catalogue_available,
+        "points_awarded": points_awarded,
+        "message": " ".join(notes) or None,
+    }
+
+
+@app.post("/api/pantry/item")
+def add_pantry_item(req: PantryItemRequest):
+    """Manually add something the user has at home but never bought on a slip."""
+    category = req.category
+    if not category:
+        # Try to place it in the catalogue so it gets a real category.
+        matched = bq.safe(
+            lambda: catalogue_service.classify_items(
+                bq.get_client(), config.DATASET, [req.item_name]
+            ),
+            [], "classify_manual_item",
+        )
+        if matched and matched[0].get("category"):
+            category = matched[0]["category"]
+
+    rows, errors = pantry_service.add_items(
+        req.user_id, [{"item_name": req.item_name, "category": category}]
+    )
+    if errors:
+        raise HTTPException(status_code=500, detail="Failed to add pantry item")
+    return {"status": "success", "items": rows}
+
+
+@app.post("/api/pantry/remove")
+def remove_pantry_item(req: PantryIdRequest):
+    return pantry_service.remove_item(req.user_id, req.pantry_item_id)
+
+
+@app.post("/api/pantry/substitute")
+def substitute_pantry_item(req: SubstituteRequest):
+    """Accept a suggested healthier swap, and bank the points for it."""
+    result = pantry_service.substitute_item(
+        req.user_id, req.pantry_item_id, req.new_name, req.new_category
+    )
+    points_service.award(req.user_id, "swap_accepted")
+    result["points_awarded"] = points_service.POINT_VALUES["swap_accepted"]
+    return result
+
+
+# ==========================================
+# RECEIPTS (partner baskets)
+# ==========================================
+@app.get("/api/receipts/{user_id}")
+def get_receipts(user_id: str, limit: int = Query(8, ge=1, le=30)):
+    receipts = bq.safe(
+        lambda: receipts_service.list_receipts(user_id, limit), [], "list_receipts"
+    )
+    return {"status": "success", "receipts": receipts}
+
+
+@app.post("/api/receipts/import")
+def import_basket(req: ImportBasketRequest):
+    """Pull a partner basket's HealthyFood lines into the pantry."""
+    items = bq.safe(
+        lambda: receipts_service.basket_items(req.user_id, req.basket_id, req.healthy_only),
+        [], "basket_items",
+    )
+    if not items:
+        return {"status": "empty", "message": "No HealthyFood items in that basket.",
+                "items": [], "points_awarded": 0}
+
+    rows, errors = pantry_service.add_items(req.user_id, items)
+    if errors:
+        raise HTTPException(status_code=500, detail="Failed to import basket")
+
+    points_service.award(req.user_id, "basket_imported")
+    return {
+        "status": "success",
+        "items": rows,
+        "count": len(rows),
+        "points_awarded": points_service.POINT_VALUES["basket_imported"],
+    }
+
+
+# ==========================================
+# RECIPES
+# ==========================================
+@app.post("/api/recipes/generate")
+def generate_recipe(req: GenerateRecipeRequest):
+    """
+    Personalised, catalogue-grounded recipe.
+
+    With `zero_waste` on, the prompt is steered at whatever is closest to
+    expiring, which is the pantry screen's headline action.
+    """
+    focus = []
+    if req.zero_waste:
+        focus = [i["name"] for i in bq.safe(
+            lambda: pantry_service.expiring_soon(req.user_id), [], "expiring_soon"
+        )]
+
+    try:
+        result = recipe_service.generate_personalized_recipe(
+            bq.get_client(), get_model(), config.DATASET, req.user_id, focus_items=focus
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Recipe generation failed: {str(exc)[:200]}")
+
+    if result.get("empty"):
+        return {"status": "empty", "message": result["message"]}
+
+    recipe_id = str(uuid.uuid4())
+    bq.insert(config.SAVED_RECIPES, [{
+        "recipe_id": recipe_id,
+        "user_id": req.user_id,
+        "recipe_name": result["recipe_name"],
+        "recipe_text": result["recipe_markdown"],
+        "missing_ingredients": json.dumps(result["missing_ingredients"]),
+        "is_favourite": False,
+        "created_at": datetime.now().isoformat(),
+    }])
+
+    reason = "zero_waste_save" if req.zero_waste else "recipe_generated"
+    points_service.award(req.user_id, reason)
+
+    return {
+        "status": "success",
+        "recipe_id": recipe_id,
+        "recipe_name": result["recipe_name"],
+        "recipe": result["recipe_markdown"],
+        "missing_ingredients": result["missing_ingredients"],
+        "used_pantry_items": result.get("used_pantry_items", []),
+        "focus_items": focus,
+        "personalized_for": result["personalized_for"],
+        "points_awarded": points_service.POINT_VALUES[reason],
+    }
+
+
+@app.get("/api/recipes/{user_id}")
+def list_recipes(user_id: str):
+    rows = bq.safe(
+        lambda: bq.select(
+            f"""
+            SELECT recipe_id, recipe_name, recipe_text, missing_ingredients,
+                   is_favourite, created_at
+            FROM `{config.SAVED_RECIPES}`
+            WHERE user_id = @user_id
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            user_id=user_id,
+        ),
+        [], "list_recipes",
+    )
+
+    recipes = []
+    for row in rows:
+        try:
+            row["missing_ingredients"] = json.loads(row.get("missing_ingredients") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            row["missing_ingredients"] = []
+        recipes.append(row)
+    return {"status": "success", "recipes": recipes}
+
+
+# ==========================================
+# SHOPPING LIST
+# ==========================================
+@app.get("/api/shopping/{user_id}")
+def get_shopping(user_id: str):
+    items = bq.safe(lambda: shopping_service.list_shopping(user_id), [], "list_shopping")
+    return {"status": "success", "items": items}
+
+
+@app.post("/api/shopping/add")
+def add_shopping(req: ShoppingAddRequest):
+    rows, errors = shopping_service.add_items(
+        req.user_id, req.items, req.recipe_name, req.for_future
+    )
+    if errors:
+        raise HTTPException(status_code=500, detail="Failed to add to shopping list")
+    return {"status": "success", "added": len(rows), "items": rows}
+
+
+@app.post("/api/shopping/bought")
+def buy_shopping(req: ShoppingIdRequest):
+    result = shopping_service.mark_bought(req.user_id, req.shopping_item_id)
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Shopping item not found")
+    points_service.award(req.user_id, "item_bought")
+    result["points_awarded"] = points_service.POINT_VALUES["item_bought"]
+    return result
+
+
+@app.post("/api/shopping/remove")
+def remove_shopping(req: ShoppingIdRequest):
+    return shopping_service.remove_item(req.user_id, req.shopping_item_id)
+
+
+# ==========================================
+# INSIGHTS
+# ==========================================
+@app.get("/api/insights/{user_id}")
+def get_insights(user_id: str):
+    """Habit observations, concrete swaps, and the monthly healthy-share trend."""
+    return {
+        "status": "success",
+        "insights": bq.safe(lambda: insights_service.habit_insights(user_id), [], "insights"),
+        "swaps": bq.safe(lambda: insights_service.swap_suggestions(user_id), [], "swaps"),
+        "trend": bq.safe(lambda: insights_service.monthly_trend(user_id), [], "trend"),
+    }
+
+
+# ==========================================
+# REWARDS & POINTS
+# ==========================================
+@app.get("/api/rewards")
+def list_rewards():
+    rewards = bq.safe(
+        lambda: bq.select(
+            f"""
+            SELECT reward_id, reward_name, partner_name, points_required,
+                   vouchers_required, reward_type, is_active
+            FROM `{config.REWARDS_CATALOG}`
+            WHERE is_active = TRUE
+            ORDER BY points_required
+            """
+        ),
+        [], "list_rewards",
+    )
+    return {"status": "success", "rewards": rewards}
+
+
+@app.get("/api/points/{user_id}")
+def get_points(user_id: str):
+    profile = bq.safe(lambda: _load_profile(user_id), None, "points_profile") or {}
+    base = int(profile.get("vitality_points") or 0)
+    summary = points_service.balance(user_id, base_points=base)
+    return {
+        "status": "success",
+        **summary,
+        "badges": points_service.badges(user_id),
+        "challenges": points_service.challenges(user_id),
+        "point_values": points_service.POINT_VALUES,
+    }
+
+
+@app.post("/api/points/award")
+def award_points(req: AwardPointsRequest):
+    return points_service.award(req.user_id, req.reason, req.amount)
+
+
+@app.post("/api/rewards/claim")
+def claim_reward(req: ClaimRewardRequest):
+    rewards = bq.safe(
+        lambda: bq.select(
+            f"""
+            SELECT reward_id, reward_name, points_required
+            FROM `{config.REWARDS_CATALOG}`
+            WHERE reward_id = @reward_id
+            """,
+            reward_id=req.reward_id,
+        ),
+        [], "claim_lookup",
+    )
+    if not rewards:
+        raise HTTPException(status_code=404, detail="Reward not found")
+
+    reward = rewards[0]
+    required = int(reward.get("points_required") or 0)
+
+    profile = bq.safe(lambda: _load_profile(req.user_id), None, "claim_profile") or {}
+    base = int(profile.get("vitality_points") or 0)
+    current = points_service.balance(req.user_id, base_points=base)["balance"]
+
+    if current < required:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You need {required - current} more points to claim this reward.",
+        )
+
+    claim_id = str(uuid.uuid4())
+    voucher_code = f"HEALTHY-{str(uuid.uuid4())[:8].upper()}"
+    bq.insert(config.CLAIMED_REWARDS, [{
+        "claim_id": claim_id,
+        "user_id": req.user_id,
+        "reward_id": req.reward_id,
+        "voucher_code": voucher_code,
+        "claimed_at": datetime.now().isoformat(),
+        "expires_at": None,
+        "status": "active",
+    }])
+
+    # Redemption is a negative row on the same ledger, so the balance stays
+    # consistent and the claim is auditable.
+    points_service.award(
+        req.user_id, "reward_claimed", amount=-required,
+        badge_name=f"Claimed: {reward.get('reward_name')}",
+    )
+
+    return {
+        "status": "success",
+        "voucher_code": voucher_code,
+        "reward_name": reward.get("reward_name"),
+        "points_spent": required,
+        "message": "Reward claimed successfully!",
+    }
+
+
+# ==========================================
+# AGGREGATE HYDRATION
+# ==========================================
+@app.get("/api/home/{user_id}")
+def get_home(user_id: str):
+    """
+    Everything the app needs on load, in one request.
+
+    Each section is independently guarded: if the rewards catalogue is missing,
+    the user still gets their pantry. Partial data beats a blank screen.
+    """
+    profile = bq.safe(lambda: _load_profile(user_id), None, "home_profile")
+    base_points = int((profile or {}).get("vitality_points") or 0)
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "profile": profile,
+        "pantry": bq.safe(lambda: pantry_service.list_pantry(user_id), [], "home_pantry"),
+        "receipts": bq.safe(lambda: receipts_service.list_receipts(user_id), [], "home_receipts"),
+        "shopping": bq.safe(lambda: shopping_service.list_shopping(user_id), [], "home_shopping"),
+        "insights": bq.safe(lambda: insights_service.habit_insights(user_id), [], "home_insights"),
+        "swaps": bq.safe(lambda: insights_service.swap_suggestions(user_id), [], "home_swaps"),
+        "trend": bq.safe(lambda: insights_service.monthly_trend(user_id), [], "home_trend"),
+        "points": bq.safe(
+            lambda: points_service.balance(user_id, base_points),
+            {"balance": base_points, "earned_in_app": 0, "events": 0}, "home_points",
+        ),
+        "badges": bq.safe(lambda: points_service.badges(user_id), [], "home_badges"),
+        "challenges": bq.safe(lambda: points_service.challenges(user_id), [], "home_challenges"),
+        "rewards": bq.safe(
+            lambda: bq.select(
+                f"""
+                SELECT reward_id, reward_name, partner_name, points_required,
+                       vouchers_required, reward_type
+                FROM `{config.REWARDS_CATALOG}`
+                WHERE is_active = TRUE ORDER BY points_required
+                """
+            ),
+            [], "home_rewards",
+        ),
+    }
+
+
+@app.get("/api/users")
+def list_users(limit: int = Query(25, ge=1, le=200)):
+    """
+    A few real customer IDs from the dataset, so the demo can switch personas
+    without anyone having to remember an ID.
+    """
+    rows = bq.safe(
+        lambda: bq.select(
+            f"""
+            SELECT `Customer ID` AS user_id, ANY_VALUE(`Customer name`) AS name,
+                   COUNT(DISTINCT `Basket ID`) AS baskets
+            FROM `{config.RAW_TRANSACTIONS}`
+            GROUP BY user_id
+            ORDER BY baskets DESC
+            LIMIT @lim
+            """,
+            lim=limit,
+        ),
+        [], "list_users",
+    )
+    return {"status": "success", "users": rows}

@@ -1,0 +1,158 @@
+"""
+catalogue_service.py
+--------------------
+Classifies food items as healthy / not by matching them against the real
+Discovery `foodCatalogue` table, instead of asking the LLM to guess.
+
+This is the source of truth the spec asks for (requirement 4.3): an item is
+"healthy" because it matches a catalogue row whose `classification = 'healthy'`
+— the same logic that drives healthy_spend in your user_profiles view.
+
+Used by the pantry-scan endpoint: Gemini reads item *names* off the photo
+(what it's good at); this module decides which of those are HealthyFood.
+"""
+
+import logging
+import re
+import time
+from google.cloud import bigquery
+
+# words that carry no signal when matching a product name to the catalogue
+log = logging.getLogger("healthyfood.catalogue")
+
+_STOPWORDS = {
+    "fresh", "the", "of", "and", "with", "low", "fat", "free", "full", "cream",
+    "pack", "bag", "box", "each", "per", "kg", "g", "ml", "l", "x",
+}
+
+
+def _tokens(name: str):
+    """Lowercase word tokens with stopwords removed."""
+    words = re.findall(r"[a-z]+", (name or "").lower())
+    return [w for w in words if w not in _STOPWORDS and len(w) > 2]
+
+
+# The catalogue is a curated list that doesn't change during a demo, but
+# classify_items() runs on every scan. Cache it in-process with a short TTL so
+# we're not paying for a full table read per photo.
+_CACHE = {"rows": None, "loaded_at": 0.0}
+_CACHE_TTL_SECONDS = 600
+
+
+def load_catalogue(bq_client, dataset: str, force: bool = False):
+    """Pull the catalogue (cached) for in-memory matching."""
+    now = time.time()
+    if not force and _CACHE["rows"] is not None and (now - _CACHE["loaded_at"]) < _CACHE_TTL_SECONDS:
+        return _CACHE["rows"]
+
+    import config
+    query = f"""
+        SELECT item_name, category, subcategory, retailer, classification
+        FROM `{config.FOOD_CATALOGUE}`
+    """
+    rows = [dict(r) for r in bq_client.query(query)]
+    _CACHE["rows"] = rows
+    _CACHE["loaded_at"] = now
+    return rows
+
+
+def _best_match(name: str, catalogue):
+    """
+    Find the catalogue row that best matches `name`.
+    Strategy: exact (normalised) match > substring containment > token overlap.
+    Returns (row, score) or (None, 0).
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return None, 0.0
+
+    # 1. exact normalised match
+    for row in catalogue:
+        if row.get("item_name", "").strip().lower() == n:
+            return row, 1.0
+
+    name_tokens = set(_tokens(name))
+    best, best_score = None, 0.0
+    for row in catalogue:
+        cat_name = row.get("item_name", "")
+        cat_low = cat_name.strip().lower()
+
+        # 2. substring containment either direction -> strong signal
+        if cat_low and (cat_low in n or n in cat_low):
+            score = 0.9
+        else:
+            # 3. token overlap (Jaccard-ish)
+            cat_tokens = set(_tokens(cat_name))
+            if not cat_tokens or not name_tokens:
+                continue
+            shared = name_tokens & cat_tokens
+            if not shared:
+                continue
+            score = len(shared) / len(name_tokens | cat_tokens)
+
+        if score > best_score:
+            best, best_score = row, score
+
+    # require a minimum confidence so we don't force bad matches
+    return (best, best_score) if best_score >= 0.34 else (None, best_score)
+
+
+def classify_items(bq_client, dataset: str, item_names):
+    """
+    Classify a list of item names against the catalogue.
+
+    Every item lands in exactly one of three states, carried in `status`:
+
+      "healthy"   - matched a catalogue row classified healthy
+      "unhealthy" - matched a catalogue row classified otherwise
+      "exempt"    - we could not verify it, so we do not judge it
+
+    "exempt" covers two different situations that the caller may want to
+    distinguish, hence `reason`: the item isn't in the catalogue at all
+    ("no_match"), or the catalogue itself was unreachable ("catalogue_offline").
+
+    The important property is that a failure NEVER produces a health verdict.
+    The whole design rests on the catalogue - not the model - deciding what is
+    healthy, so when the catalogue can't answer, the honest output is "exempt"
+    rather than a guess in either direction.
+    """
+    try:
+        catalogue = load_catalogue(bq_client, dataset)
+        catalogue_available = True
+    except Exception as exc:  # noqa: BLE001
+        # Degrade instead of failing: the user still gets to see what was read
+        # off their slip, just without verdicts.
+        log.warning("catalogue unavailable, classifying everything as exempt: %s", exc)
+        catalogue = []
+        catalogue_available = False
+
+    results = []
+    for name in item_names:
+        row, _score = _best_match(name, catalogue) if catalogue else (None, 0.0)
+
+        if row:
+            classification = (row.get("classification") or "").strip()
+            healthy = classification.lower() == "healthy"
+            results.append({
+                "input_name": name,
+                "matched_item": row.get("item_name"),
+                "category": row.get("category"),
+                "retailer": row.get("retailer"),
+                "classification": classification or None,
+                "is_healthy": healthy,
+                "status": "healthy" if healthy else "unhealthy",
+                "reason": None,
+            })
+        else:
+            results.append({
+                "input_name": name,
+                "matched_item": None,
+                "category": None,
+                "retailer": None,
+                "classification": None,
+                "is_healthy": False,   # exempt is never counted as healthy
+                "status": "exempt",
+                "reason": "catalogue_offline" if not catalogue_available else "no_match",
+            })
+
+    return results, catalogue_available
