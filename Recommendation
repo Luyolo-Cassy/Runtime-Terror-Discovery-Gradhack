@@ -38,6 +38,8 @@ Catalogue items (from foodCatalogue — retailer, category, subcategory, item_na
 User's pantry contents:
 {pantry_items}
 
+{length_instruction}
+
 Return ONLY valid JSON in this shape, with no markdown fences or extra text:
 {{
   "recipe_title": string,
