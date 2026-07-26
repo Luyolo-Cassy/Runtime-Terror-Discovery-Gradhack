@@ -732,7 +732,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setBusy(`reward-${reward.reward_id}`, true);
     try {
       const res = await api.claimReward(ref.current.userId, reward.reward_id);
-      dispatch({ type: "ADD_POINTS", amount: -(res.points_spent ?? required) });
+      const points = await api.getPoints(ref.current.userId);
+      dispatch({ type: "SET_POINTS", points: points.balance, badges: points.badges, challenges: points.challenges });
+      dispatch({ type: "UPDATE_PROFILE", patch: { vitalityPoints: points.balance } });
       dispatch({
         type: "ADD_VOUCHER",
         voucher: {
@@ -774,6 +776,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         badges: points.badges,
         challenges: points.challenges,
       });
+      dispatch({ type: "UPDATE_PROFILE", patch: { vitalityPoints: points.balance } });
       toast(`Challenge complete: ${challenge.title} (+${challenge.reward} pts)`);
     } catch (err) {
       fail("Could not claim challenge", err);
