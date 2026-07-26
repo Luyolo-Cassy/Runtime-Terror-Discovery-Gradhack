@@ -390,7 +390,6 @@ async def scan_receipt(
     classified, catalogue_available = catalogue_service.classify_items(
         bq.get_client(), config.DATASET, names,
     )
-    classified = catalogue_service.classify_items(bq.get_client(), config.DATASET, names)
     log.info("scan_receipt: classified %d item(s) against catalogue", len(classified))  # LOG
 
     # Only verified-healthy items go into the pantry. Exempt items are shown to
@@ -478,10 +477,11 @@ def add_pantry_item(req: PantryItemRequest):
             lambda: catalogue_service.classify_items(
                 bq.get_client(), config.DATASET, [req.item_name]
             ),
-            [], "classify_manual_item",
+            ([], False), "classify_manual_item",
         )
-        if matched and matched[0].get("category"):
-            category = matched[0]["category"]
+        results = matched[0] if isinstance(matched, tuple) else matched
+        if results and results[0].get("category"):
+            category = results[0]["category"]
             log.info("add_pantry_item: catalogue matched category=%s for item_name=%s",  # LOG
                       category, req.item_name)
 
