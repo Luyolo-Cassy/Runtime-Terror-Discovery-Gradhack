@@ -5,7 +5,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import { AlertCircle, HeartPulse, Wifi, WifiOff } from "lucide-react-native";
+import { AlertCircle, HeartPulse } from "lucide-react-native";
 
 import { Colors, Radius, Shadows, Spacing, alpha } from "@/constants/theme";
 import { useApp } from "@/data/store";
@@ -49,7 +49,6 @@ export function Screen({
           <View style={styles.brand}>
             <HeartPulse size={18} color={Colors.primary} strokeWidth={2.5} />
             <Text style={styles.brandText}>HEALTHYFOOD</Text>
-            <ModeBadge live={state.mode === "live" && !state.error} />
           </View>
 
           <Pressable
@@ -106,19 +105,6 @@ export function Screen({
           <Text style={styles.toastText}>{state.toast}</Text>
         </View>
       ) : null}
-    </View>
-  );
-}
-
-function ModeBadge({ live }: { live: boolean }) {
-  return (
-    <View style={[styles.badge, { backgroundColor: live ? alpha(Colors.vitality, 0.15) : Colors.surface2 }]}>
-      {live
-        ? <Wifi size={9} color={Colors.vitality} />
-        : <WifiOff size={9} color={Colors.muted} />}
-      <Text style={[styles.badgeText, { color: live ? Colors.vitality : Colors.muted }]}>
-        {live ? "LIVE" : "DEMO"}
-      </Text>
     </View>
   );
 }

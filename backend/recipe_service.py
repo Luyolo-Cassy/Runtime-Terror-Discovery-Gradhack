@@ -30,6 +30,26 @@ HEALTHY_TERMS = ["healthy"]
 
 CATALOGUE_SAMPLE_SIZE = 40   # how many catalogue items to show Gemini as options
 
+# ── Recipe length options ────────────────────────────────────────────────
+# MERGED IN from the standalone recipe-length feature. Kept as plain text
+# blocks (not inline in build_prompt) so wording can be tuned without
+# touching prompt-assembly logic. If Gemini doesn't respect the numeric
+# limits during testing, tighten the wording (e.g. add "STRICT maximum").
+LENGTH_INSTRUCTIONS = {
+    "short": (
+        "Keep the recipe SHORT and simple: no more than 5 ingredients "
+        "and no more than 4 steps. Prioritize quick, low-effort meals."
+    ),
+    "long": (
+        "Make this a more DETAILED recipe: include richer ingredient variety "
+        "and 6-10 clear steps, with brief technique notes where useful "
+        "(e.g. how to tell when something is cooked)."
+    ),
+}
+DEFAULT_LENGTH_INSTRUCTION = (
+    "Use a standard recipe length: roughly 5-8 ingredients and 4-6 steps."
+)
+
 
 # ---------------------------------------------------------------------------
 # DATA ACCESS  (all reads go through your clean tables/views, never `dataset`
@@ -92,13 +112,16 @@ def get_healthy_catalogue(bq_client, dataset: str, limit: int = CATALOGUE_SAMPLE
 # ---------------------------------------------------------------------------
 # PROMPT + PARSING
 # ---------------------------------------------------------------------------
-def build_prompt(pantry, profile, catalogue, focus_items=None):
+def build_prompt(pantry, profile, catalogue, focus_items=None, recipe_length="standard"):
     """
     Assemble a grounded, personalised prompt that asks Gemini for strict JSON.
 
     `focus_items` drives the zero-waste path: when the pantry screen asks for a
     recipe built around what's about to expire, those item names are passed here
     and the model is told to prioritise them.
+
+    `recipe_length` ("short" / "long" / "standard") controls ingredient/step
+    count via LENGTH_INSTRUCTIONS above — MERGED IN from the standalone service.
     """
     catalogue_names = [c["item_name"] for c in catalogue if c.get("item_name")]
 
@@ -126,6 +149,8 @@ def build_prompt(pantry, profile, catalogue, focus_items=None):
     else:
         persona = "- No profile on file yet; keep the recipe broadly healthy and budget-friendly."
 
+    length_instruction = LENGTH_INSTRUCTIONS.get(recipe_length, DEFAULT_LENGTH_INSTRUCTION)
+
     return f"""You are a professional nutritionist and chef for the Discovery HealthyFood Companion app.
 
 The user already has these pantry items:
@@ -133,6 +158,8 @@ The user already has these pantry items:
 {urgency}
 What we know about this user:
 {persona}
+
+{length_instruction}
 
 These are real HealthyFood catalogue items available at partner stores. When you list
 things the user still needs to buy ("missing_ingredients"), you MUST choose ONLY from
@@ -200,12 +227,16 @@ def enrich_missing(missing_names, catalogue):
 # ORCHESTRATOR  (call this from the endpoint)
 # ---------------------------------------------------------------------------
 def generate_personalized_recipe(bq_client, model, dataset: str, user_id: str,
-                                 focus_items=None):
+                                  focus_items=None, recipe_length="standard"):
     """
     Returns a dict ready to serialise as the API response.
 
     `focus_items` (optional) is a list of pantry item names to build the recipe
     around - used by the zero-waste path, which passes whatever is expiring.
+
+    `recipe_length` (optional, "short" / "standard" / "long") - MERGED IN from
+    the standalone recipe-length feature. Defaults to "standard" so existing
+    callers that don't pass it keep working unchanged.
     """
     pantry = get_available_pantry(bq_client, dataset, user_id)
     if not pantry:
@@ -214,7 +245,7 @@ def generate_personalized_recipe(bq_client, model, dataset: str, user_id: str,
     profile = get_user_profile_lite(bq_client, dataset, user_id)
     catalogue = get_healthy_catalogue(bq_client, dataset)
 
-    prompt = build_prompt(pantry, profile, catalogue, focus_items)
+    prompt = build_prompt(pantry, profile, catalogue, focus_items, recipe_length)
     ai_raw = model.generate_content(prompt).text
     ai = parse_ai_json(ai_raw)
     missing = enrich_missing(ai["missing_ingredients"], catalogue)
@@ -235,5 +266,6 @@ def generate_personalized_recipe(bq_client, model, dataset: str, user_id: str,
         "missing_ingredients": missing,          # list of {item_name, retailer, category}
         "used_pantry_items": pantry,
         "focus_items": focus_items or [],
+        "recipe_length": recipe_length,
         "personalized_for": personalized_for,    # None if no profile yet
     }
